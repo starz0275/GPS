@@ -18,7 +18,25 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 from pathlib import Path
+
+# 配置中文字体
+font_paths = [
+    'C:/Windows/Fonts/msyh.ttc',    # 微软雅黑
+    'C:/Windows/Fonts/simhei.ttf',  # 黑体
+    'C:/Windows/Fonts/simsun.ttc',  # 宋体
+]
+for fp in font_paths:
+    if Path(fp).exists():
+        fm.fontManager.addfont(fp)
+        prop = fm.FontProperties(fname=fp)
+        font_name = prop.get_name()
+        matplotlib.rcParams['font.family'] = 'sans-serif'
+        matplotlib.rcParams['font.sans-serif'] = [font_name] + matplotlib.rcParams['font.sans-serif']
+        break
+
+matplotlib.rcParams['axes.unicode_minus'] = False
 from scipy.interpolate import interp1d
 from scipy.ndimage import median_filter
 import json, warnings
