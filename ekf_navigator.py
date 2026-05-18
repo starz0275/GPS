@@ -124,9 +124,9 @@ class EKF2D:
         # H = [1, 0]，量测 = θ
         S  = self.P[0, 0] + r + EPS
         K  = self.P[:, 0] / S             # (2,) 卡尔曼增益
-        inn = gps_theta - self.theta       # 创新量
-        # 限制创新量（防止 GPS 角度跳变带来的大修正）
-        inn = np.clip(inn, -np.pi / 2, np.pi / 2)
+        inn = np.arctan2(np.sin(gps_theta - self.theta),
+                         np.cos(gps_theta - self.theta))
+        inn = float(np.clip(inn, -np.pi / 2, np.pi / 2))
         self.theta += K[0] * inn
         self.db    += K[1] * inn
         # Joseph 形式协方差更新
@@ -241,24 +241,27 @@ class EKFNavigatorNP:
         imu_norm  = self._normalize_imu(imu_raw)
         net_bias  = self._predict_bias(imu_norm)
 
-        # 步骤 2：确定初始航向
+        # 步骤 2：确定初始航向（需 GPS 有效且航向有限）
         if theta_init is None:
-            valid_idx = np.where(gps_valid)[0]
+            ok = gps_valid & np.isfinite(gps_theta)
+            valid_idx = np.where(ok)[0]
             theta_init = float(gps_theta[valid_idx[0]]) if len(valid_idx) > 0 else 0.0
 
-        # 步骤 3：GPS 锚定 + BiasNet 修正
-        # GPS 有效时直接锚定航向；GPS 丢失时用 BiasNet 修正陀螺积分。
+        # 步骤 3：GPS 锚定航向 + BiasNet 修正陀螺（丢失段）
         headings = np.empty(T, dtype=np.float32)
         dx_arr   = np.empty(T, dtype=np.float32)
         dy_arr   = np.empty(T, dtype=np.float32)
 
         heading = theta_init
-
         for k in range(T):
-            if gps_valid[k]:
+            if gps_valid[k] and np.isfinite(gps_theta[k]):
                 heading = float(gps_theta[k])
             else:
-                heading += (gyro_z_rad[k] - float(net_bias[k])) * dt
+                g = float(gyro_z_rad[k]) if np.isfinite(gyro_z_rad[k]) else 0.0
+                b = float(net_bias[k]) if np.isfinite(net_bias[k]) else 0.0
+                heading += (g - b) * dt
+            if not np.isfinite(heading):
+                heading = theta_init
 
             headings[k] = heading
             dx_arr[k]   = float(v_ms[k]) * np.cos(heading) * dt

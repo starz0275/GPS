@@ -35,9 +35,9 @@ VEH_SPD_RAW_FACTOR = 260.63    # VehSpdRaw / factor = km/h
 GPS_MAX_SPEED_KMH  = 150.0     # GPS 跳点速度阈值
 MIN_SPEED_MS       = 0.5       # 低于此速度不计算 GPS 航向
 
-# 260316 按时间切分：前 70% 训练，后 30% 验证
-TRAIN_SPLIT_T     = 490.0      # 训练/验证分割点（秒）
-REAL_TEST_T_START = 490.0      # 验证集起始时间（秒）
+# 260316 按时间切分：前段训练，后段验证（验证段与 validate_trajectory 一致）
+TRAIN_SPLIT_T     = 490.0      # 训练时间上限（秒）
+REAL_TEST_T_START = 620.0      # 验证集起始（秒），held-out
 
 EARTH_A    = 6378137.0
 EARTH_E2   = 0.00669437999014132
@@ -517,7 +517,6 @@ def create_windows(df, window_size, stride):
 
     n = len(df)
     for i in range(0, n - window_size, stride):
-        # 窗口内所有帧必须 GPS 有效（保证标签质量）
         if gps_ok[i:i+window_size].all():
             X_list.append(feat[i:i+window_size])
             target_idx = i + window_size - 1
@@ -530,6 +529,97 @@ def create_windows(df, window_size, stride):
 
     return (np.array(X_list, dtype=np.float32),
             np.array(Y_list,  dtype=np.float32),
+            np.array(ts_list, dtype=np.float32))
+
+
+# 隧道增强：模拟 GPS 丢失段，让 TCN 学习 outage 下的残差
+TUNNEL_AUG_DURATION_S = 50.0
+TUNNEL_AUG_STRIDE     = 15     # 每隔多少帧取一个隧道窗口起点
+TUNNEL_AUG_MAX_PER_DF = 200    # 每段数据最多增强窗口数
+
+
+def _recompute_base_for_outage(df, out_start, out_end):
+    """
+    在 [out_start, out_end) 模拟 GPS 丢失，按推理逻辑重算 Base 与 Target。
+    返回更新后的 Target_dx/dy 及 Base_dx/dy（仅用于构造特征/标签）。
+    """
+    n = len(df)
+    gps_sim = df['GPS_valid'].values.astype(bool).copy()
+    gps_sim[out_start:out_end] = False
+
+    head_deg = 90.0 - df['Heading_rad'].values * RAD2DEG
+    v_ms = df['VehicleSpeed_ms'].values
+    t_arr = df['Time_s'].values
+
+    heading = compute_heading_with_gps_anchor(
+        t_arr, df['GyroZ_degs'].values, v_ms,
+        gps_heading_deg=head_deg,
+        gps_valid=gps_sim)
+    base_dx, base_dy = dead_reckoning_nhc(t_arr, v_ms, heading)
+    true_dx = df['True_dx'].values
+    true_dy = df['True_dy'].values
+    return base_dx, base_dy, true_dx - base_dx, true_dy - base_dy
+
+
+def create_windows_with_tunnel(df, window_size, stride, norm_stats):
+    """标准 GPS 有效窗口 + 模拟隧道窗口。"""
+    X, Y, ts = create_windows(df, window_size, stride)
+    X_list = list(X) if len(X) else []
+    Y_list = list(Y) if len(Y) else []
+    ts_list = list(ts) if len(ts) else []
+
+    n = len(df)
+    tunnel_frames = int(TUNNEL_AUG_DURATION_S / TARGET_DT)
+    gps_ok = df['GPS_valid'].values.astype(bool)
+    times = df['Time_s'].values
+    feat_cols = [f'{c}_norm' for c in FEATURE_COLS]
+
+    added = 0
+    i = window_size
+    while i < n - window_size and added < TUNNEL_AUG_MAX_PER_DF:
+        out_start = i + 5
+        out_end = min(out_start + tunnel_frames, n - 5)
+        if out_end - out_start < tunnel_frames // 2:
+            i += TUNNEL_AUG_STRIDE
+            continue
+        # 隧道前后需有真实 GPS（标签可靠）
+        if not gps_ok[max(0, out_start - 10):out_start].any():
+            i += TUNNEL_AUG_STRIDE
+            continue
+        if not gps_ok[out_end:min(out_end + 10, n)].any():
+            i += TUNNEL_AUG_STRIDE
+            continue
+
+        bdx, bdy, tdx, tdy = _recompute_base_for_outage(df, out_start, out_end)
+        win_end = out_start + window_size - 1
+        if win_end >= out_end or win_end >= n:
+            i += TUNNEL_AUG_STRIDE
+            continue
+
+        feat_win = np.zeros((window_size, len(FEATURE_COLS)), dtype=np.float32)
+        for j, t in enumerate(range(i, i + window_size)):
+            for c, col in enumerate(FEATURE_COLS):
+                if col == 'Base_dx':
+                    val = float(bdx[t])
+                elif col == 'Base_dy':
+                    val = float(bdy[t])
+                else:
+                    feat_win[j, c] = float(df[f'{col}_norm'].iloc[t])
+                    continue
+                mu, std = norm_stats[col]['mean'], norm_stats[col]['std']
+                feat_win[j, c] = (val - mu) / (std + 1e-6)
+
+        tgt_i = i + window_size - 1
+        X_list.append(feat_win)
+        Y_list.append([tdx[tgt_i], tdy[tgt_i]])
+        ts_list.append(times[tgt_i])
+        added += 1
+        i += TUNNEL_AUG_STRIDE
+
+    if not X_list:
+        return X, Y, ts
+    return (np.array(X_list, dtype=np.float32),
+            np.array(Y_list, dtype=np.float32),
             np.array(ts_list, dtype=np.float32))
 
 
@@ -567,7 +657,8 @@ def main():
     X_parts, Y_parts, ts_parts = [], [], []
     for df in all_dfs:
         df = normalize_df(df, norm_stats)
-        X_, Y_, ts_ = create_windows(df, WINDOW_SIZE, WINDOW_STRIDE)
+        X_, Y_, ts_ = create_windows_with_tunnel(
+            df, WINDOW_SIZE, WINDOW_STRIDE, norm_stats)
         if len(X_) > 0:
             X_parts.append(X_)
             Y_parts.append(Y_)

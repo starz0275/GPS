@@ -2,7 +2,22 @@
   "permissions": {
     "allow": [
       "Bash(python validate_ekf.py)",
-      "Bash(python train_ekf.py)"
+      "Bash(python train_ekf.py)",
+      "Bash(python plot_gnss_calibration_trajectory.py)",
+      "Bash(pip install *)",
+      "Bash(where python *)",
+      "Bash(pip list *)",
+      "Bash(python *)",
+      "Bash(conda run *)",
+      "Read(//c/Users/nxj/.conda/envs/traj312/**)",
+      "Read(//c/Users/nxj/anaconda3/envs/traj312/**)",
+      "Read(//c/Users/nxj/miniconda3/envs/traj312/**)",
+      "Read(//d/anaconda3/envs/traj312/**)",
+      "Bash(where conda *)",
+      "Read(//c/Users/nxj/**)",
+      "Read(//c/Users/nxj/AppData/Local/**)",
+      "Bash(ls -d /d/*conda*)",
+      "Bash(find /d -maxdepth 4 -name \"traj312\" -type d)"
     ]
   }
 }

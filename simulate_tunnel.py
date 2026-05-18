@@ -1,6 +1,6 @@
 """
-隧道闭环模拟器 (双轨对比版：FP32 vs INT8)
-同时运行未量化的 Keras 模型和量化后的 TFLite 模型，直观对比量化精度损失。
+【非主流程】TCN 量化对比：FP32 vs INT8，用训练集窗口切片，不是 EKF+GNSS 融合验证。
+主流程请看: validate_trajectory.py / predict_full_trajectory.py
 """
 import numpy as np
 import pandas as pd

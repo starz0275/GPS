@@ -54,7 +54,7 @@ WEIGHTS_PATH   = MODEL_DIR / "biasnet_weights.weights.h5"
 NORM_JSON      = Path(__file__).parent / "preprocessed_data" / "normalization_stats.json"
 OUTPUT_DIR     = MODEL_DIR
 
-REAL_TEST_T_START = 0.0       # 完整 260316 轨迹验证
+REAL_TEST_T_START = 620.0     # 与 trajectory_data.VAL_T_START 一致
 TARGET_DT         = 0.1       # s
 DEG2RAD           = np.pi / 180.0
 RAD2DEG           = 180.0 / np.pi
