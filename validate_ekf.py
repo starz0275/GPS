@@ -54,7 +54,7 @@ WEIGHTS_PATH   = MODEL_DIR / "biasnet_weights.weights.h5"
 NORM_JSON      = Path(__file__).parent / "preprocessed_data" / "normalization_stats.json"
 OUTPUT_DIR     = MODEL_DIR
 
-REAL_TEST_T_START = 620.0     # 与 data_preprocessing_v2 保持一致
+REAL_TEST_T_START = 0.0       # 完整 260316 轨迹验证
 TARGET_DT         = 0.1       # s
 DEG2RAD           = np.pi / 180.0
 RAD2DEG           = 180.0 / np.pi
@@ -436,6 +436,31 @@ def main():
         gps_valid  = gps_v_sim,
         dt         = TARGET_DT,
     )
+
+    # ---- 诊断：检查零偏预测是否合理 ----
+    print("\n[诊断] 零偏预测统计：")
+    print(f"  归一化统计量（标定数据）:")
+    for k in ['AccX_g','AccY_g','AccZ_g','GyroX_degs','GyroY_degs','GyroZ_degs']:
+        print(f"    {k:16s}  mean={norm_stats[k]['mean']:+8.4f}  std={norm_stats[k]['std']:.4f}")
+    print(f"  260316 IMU 原始范围:")
+    imu_cols = ['AccXRaw','AccYRaw','AccZRaw','GyroXRaw','GyroYRaw','GyroZRaw']
+    for i, c in enumerate(imu_cols):
+        print(f"    {c:16s}  mean={seq_sim['imu_raw'][:,i].mean():+8.4f}  std={seq_sim['imu_raw'][:,i].std():.4f}")
+    print(f"  BiasNet 预测零偏: mean={ekf_bias.mean()*RAD2DEG:.4f} deg/s  "
+          f"std={ekf_bias.std()*RAD2DEG:.4f} deg/s  "
+          f"min={ekf_bias.min()*RAD2DEG:.4f}  max={ekf_bias.max()*RAD2DEG:.4f}")
+    print(f"  陀螺 Z 原始角速度: mean={seq_sim['gyro_z_rad'].mean()*RAD2DEG:.4f} deg/s  "
+          f"std={seq_sim['gyro_z_rad'].std()*RAD2DEG:.4f} deg/s")
+
+    # ---- 诊断：GPS 丢失段航向误差 ----
+    gps_th_full = seq['gps_theta']  # 完整 GPS 航向真值
+    print(f"\n[诊断] GPS 丢失段航向对比（索引 {loss_start}–{loss_end}）：")
+    dr_head_err  = (dr_h[loss_start:loss_end] - gps_th_full[loss_start:loss_end]) * RAD2DEG
+    ekf_head_err = (ekf_h[loss_start:loss_end] - gps_th_full[loss_start:loss_end]) * RAD2DEG
+    print(f"  纯 DR  航向误差: 起点={dr_head_err[0]:.2f}°  终点={dr_head_err[-1]:.2f}°  "
+          f"max={np.abs(dr_head_err).max():.2f}°")
+    print(f"  EKF    航向误差: 起点={ekf_head_err[0]:.2f}°  终点={ekf_head_err[-1]:.2f}°  "
+          f"max={np.abs(ekf_head_err).max():.2f}°")
 
     # 5. 绘图 + 指标（仅在 GPS 丢失段结束后的第一个 GPS 有效帧评估）
     print("\n[4] 绘制结果 ...")

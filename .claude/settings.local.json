@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python validate_ekf.py)",
+      "Bash(python train_ekf.py)"
+    ]
+  }
+}

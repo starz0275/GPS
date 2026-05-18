@@ -83,8 +83,8 @@ class EKF2D:
 
     def __init__(self,
                  theta_init: float = 0.0,
-                 q_theta: float   = 0.0,       # 航向过程噪声（确定性传播，置 0）
-                 q_db: float      = 1e-7,       # 残余零偏随机游走
+                 q_theta: float   = 1e-5,       # 航向过程噪声 rad²/step（GPS 丢失时航向不确定性增长）
+                 q_db: float      = 1e-5,       # 残余零偏随机游走 rad²/step
                  r_theta: float   = 1e-3,       # GPS 航向量测噪声 (rad²)
                  P_init=None):
         self.theta = float(theta_init)
@@ -164,7 +164,7 @@ class EKFNavigatorNP:
                  weights_path: str,
                  norm_stats: dict,
                  window_size: int = 30,
-                 q_db: float = 1e-7,
+                 q_db: float = 1e-5,
                  r_theta: float = 1e-3):
         self.window_size = window_size
         self.norm_stats  = norm_stats
@@ -246,25 +246,23 @@ class EKFNavigatorNP:
             valid_idx = np.where(gps_valid)[0]
             theta_init = float(gps_theta[valid_idx[0]]) if len(valid_idx) > 0 else 0.0
 
-        ekf = EKF2D(theta_init=theta_init,
-                    q_db=self.q_db,
-                    r_theta=self.r_theta)
-
-        # 步骤 3：逐帧运行 EKF
+        # 步骤 3：GPS 锚定 + BiasNet 修正
+        # GPS 有效时直接锚定航向；GPS 丢失时用 BiasNet 修正陀螺积分。
         headings = np.empty(T, dtype=np.float32)
         dx_arr   = np.empty(T, dtype=np.float32)
         dy_arr   = np.empty(T, dtype=np.float32)
 
+        heading = theta_init
+
         for k in range(T):
-            ekf.propagate(gyro_z_rad[k], float(net_bias[k]), dt)
-
             if gps_valid[k]:
-                ekf.update_gps_heading(float(gps_theta[k]))
+                heading = float(gps_theta[k])
+            else:
+                heading += (gyro_z_rad[k] - float(net_bias[k])) * dt
 
-            theta_k      = ekf.heading
-            headings[k]  = theta_k
-            dx_arr[k]    = float(v_ms[k]) * np.cos(theta_k) * dt
-            dy_arr[k]    = float(v_ms[k]) * np.sin(theta_k) * dt
+            headings[k] = heading
+            dx_arr[k]   = float(v_ms[k]) * np.cos(heading) * dt
+            dy_arr[k]   = float(v_ms[k]) * np.sin(heading) * dt
 
         # 步骤 4：位置累积
         enu_x = np.cumsum(dx_arr)

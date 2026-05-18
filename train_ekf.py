@@ -58,7 +58,7 @@ LR              = 3e-4
 PATIENCE        = 15
 BIAS_SMOOTH_W   = 31          # 零偏平滑窗口（帧），≈3 s
 
-REAL_TRAIN_T_MAX = 600.0      # 与 data_preprocessing_v2 保持一致
+TRAIN_SPLIT_T   = 490.0       # 260316 前 70% 用于训练，后 30% 用于验证
 
 # ============================================================================
 # 坐标工具
@@ -166,12 +166,13 @@ def load_calibration_seq(data_dir):
 
 
 # ============================================================================
-# 数据加载：260316 真实数据（训练段）
+# 数据加载：260316 训练段（前 70%）
 # ============================================================================
 
-def load_real_seq(csv_path):
+def load_real_seq(csv_path, t_max=None):
     df = pd.read_csv(csv_path)
-    df = df[df['Time'] < REAL_TRAIN_T_MAX].copy().reset_index(drop=True)
+    if t_max is not None:
+        df = df[df['Time'] < t_max].copy().reset_index(drop=True)
     if len(df) < 100:
         return []
 
@@ -180,7 +181,8 @@ def load_real_seq(csv_path):
     tg = np.arange(t_s, t_e, TARGET_DT)
 
     def interp1(src_v, fill=0.0):
-        mask = ~np.isnan(src_v)
+        mask = ~np.isnan(src_v.astype(float)) if np.isnan(src_v.astype(float)).any() \
+               else np.ones(len(src_v), bool)
         if mask.sum() < 2:
             return np.full(len(tg), fill, dtype=np.float32)
         return interp1d(t_raw[mask], src_v[mask], bounds_error=False,
@@ -188,7 +190,7 @@ def load_real_seq(csv_path):
 
     imu_cols_raw = ['AccXRaw','AccYRaw','AccZRaw','GyroXRaw','GyroYRaw','GyroZRaw']
     imu_mat = np.stack([interp1(df[c].values) for c in imu_cols_raw], axis=1)
-    v_ms = interp1(df['VehSpdRaw'].values / VEH_SPD_FACTOR / 3.6)   # km/h → m/s
+    v_ms = interp1(df['VehSpdRaw'].values / VEH_SPD_FACTOR / 3.6)
 
     lat_raw = df['LatitudeRaw'].values.copy().astype(float)
     lon_raw = df['LongitudeRaw'].values.copy().astype(float)
@@ -196,7 +198,6 @@ def load_real_seq(csv_path):
     lat_raw[~gps_ok_raw] = np.nan
     lon_raw[~gps_ok_raw] = np.nan
 
-    # 有效段跳点清洗
     valid_idx = np.where(gps_ok_raw)[0]
     if len(valid_idx) > 2:
         lv, lnv, ok2 = clean_gps_outliers(
@@ -224,14 +225,12 @@ def load_real_seq(csv_path):
     gps_theta  = np.arctan2(dy, dx)
     gps_theta_smooth = median_filter(gps_theta, size=11).astype(np.float32)
 
-    # 如果 HeadingRaw 存在且更可靠，融合之
     if 'HeadingRaw' in df.columns:
         head_raw_v = df['HeadingRaw'].values.copy().astype(float)
         head_raw_v[head_raw_v < 1] = np.nan
         head_g = interp1(head_raw_v, fill=np.nan)
         has_raw = ~np.isnan(head_g) & head_valid
         if has_raw.sum() > 10:
-            # HeadingRaw：北顺时针度 → ENU 弧度
             enu_head = (90.0 - head_g) * DEG2RAD
             gps_theta_smooth[has_raw] = enu_head[has_raw].astype(np.float32)
 
@@ -360,11 +359,9 @@ def main():
     print("BiasNet 训练：陀螺 Z 轴零偏预测")
     print("=" * 60)
 
-    # 1. 加载数据
+    # 1. 加载数据（仅用 260316 训练段）
     print("\n[1] 加载数据 ...")
-    seqs = load_calibration_seq(DATA_DIR_CALIB)
-    if DATA_CSV_REAL.exists():
-        seqs += load_real_seq(DATA_CSV_REAL)
+    seqs = load_real_seq(DATA_CSV_REAL, t_max=TRAIN_SPLIT_T) if DATA_CSV_REAL.exists() else []
     if not seqs:
         raise RuntimeError("未找到任何训练数据，请先运行 data_preprocessing_v2.py")
 

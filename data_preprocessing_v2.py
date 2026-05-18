@@ -35,9 +35,9 @@ VEH_SPD_RAW_FACTOR = 260.63    # VehSpdRaw / factor = km/h
 GPS_MAX_SPEED_KMH  = 150.0     # GPS 跳点速度阈值
 MIN_SPEED_MS       = 0.5       # 低于此速度不计算 GPS 航向
 
-# 260316 数据按时间切分：训练 / 测试（测试段完全不参与训练）
-REAL_TRAIN_T_MAX  = 600.0      # 训练用时间上限（秒）
-REAL_TEST_T_START = 620.0      # 测试集起始时间（秒）
+# 260316 按时间切分：前 70% 训练，后 30% 验证
+TRAIN_SPLIT_T     = 490.0      # 训练/验证分割点（秒）
+REAL_TEST_T_START = 490.0      # 验证集起始时间（秒）
 
 EARTH_A    = 6378137.0
 EARTH_E2   = 0.00669437999014132
@@ -544,28 +544,23 @@ def main():
 
     all_dfs = []
 
-    # 1. 标定实车数据
-    print("\n[1/4] 加载标定实车数据...")
-    calib_dfs = load_calibration_dataset(DATA_DIR_CALIB)
-    all_dfs.extend(calib_dfs)
-
-    # 2. 260316 真实数据（只用训练段，测试段单独保存）
-    print("\n[2/4] 加载 260316 真实路跑数据（训练段）...")
+    # 1. 260316 训练段（标定数据 IMU 统计差异太大，不混用）
+    print("\n[1/3] 加载 260316 真实路跑数据（训练段 t<{:.0f}s）...".format(TRAIN_SPLIT_T))
     if DATA_CSV_REAL.exists():
-        real_dfs = load_real_dataset(DATA_CSV_REAL, t_max=REAL_TRAIN_T_MAX)
+        real_dfs = load_real_dataset(DATA_CSV_REAL, t_max=TRAIN_SPLIT_T)
         all_dfs.extend(real_dfs)
     else:
-        print(f"  [SKIP] {DATA_CSV_REAL} 不存在")
+        raise RuntimeError(f"{DATA_CSV_REAL} 不存在")
 
     if not all_dfs:
         raise RuntimeError("没有加载任何数据！")
 
-    # 3. 标签大跳点二次清洗
-    print("\n[3/4] 标签大跳点清洗...")
+    # 2. 标签大跳点二次清洗
+    print("\n[2/3] 标签大跳点清洗...")
     all_dfs = [clean_label_outliers(df) for df in all_dfs]
 
-    # 4. 联合归一化
-    print("\n[4/4] 计算归一化统计量（跨数据集）...")
+    # 3. 归一化
+    print("\n[3/3] 计算归一化统计量（260316 训练段）...")
     norm_stats = compute_norm_stats(all_dfs)
 
     # 5. 归一化 + 滑动窗口
@@ -612,8 +607,8 @@ def main():
           f"  range=[{Y_all[:,1].min():.3f}, {Y_all[:,1].max():.3f}]")
     print("=" * 70)
 
-    # ---- 生成测试集（260316 最后一段，训练时从未见过） ----
-    print("\n[测试集] 处理 260316 测试段 (t >= {:.0f}s)...".format(REAL_TEST_T_START))
+    # ---- 生成验证集（260316 后 30%，训练时从未见过） ----
+    print("\n[验证集] 处理 260316 验证段 (t >= {:.0f}s)...".format(REAL_TEST_T_START))
     if DATA_CSV_REAL.exists():
         test_dfs = load_real_dataset(DATA_CSV_REAL, t_min=REAL_TEST_T_START)
         test_dfs = [clean_label_outliers(df) for df in test_dfs]
