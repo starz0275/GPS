@@ -35,6 +35,10 @@ VEH_SPD_RAW_FACTOR = 260.63    # VehSpdRaw / factor = km/h
 GPS_MAX_SPEED_KMH  = 150.0     # GPS 跳点速度阈值
 MIN_SPEED_MS       = 0.5       # 低于此速度不计算 GPS 航向
 
+# 260316 数据按时间切分：训练 / 测试（测试段完全不参与训练）
+REAL_TRAIN_T_MAX  = 600.0      # 训练用时间上限（秒）
+REAL_TEST_T_START = 620.0      # 测试集起始时间（秒）
+
 EARTH_A    = 6378137.0
 EARTH_E2   = 0.00669437999014132
 DEG2RAD    = np.pi / 180.0
@@ -312,9 +316,19 @@ def load_calibration_dataset(data_dir):
 # 加载 260316 真实数据
 # ============================================================================
 
-def load_real_dataset(csv_path):
+def load_real_dataset(csv_path, t_max=None, t_min=None):
+    """
+    t_max: 只使用 Time < t_max 的数据（训练时用）
+    t_min: 只使用 Time >= t_min 的数据（测试时用）
+    """
     print(f"  读取 {csv_path.name} ...")
     df = pd.read_csv(csv_path)
+    if t_max is not None:
+        df = df[df['Time'] < t_max].copy().reset_index(drop=True)
+        print(f"  [训练] 截断到 t<{t_max}s，剩余 {len(df)} 行")
+    if t_min is not None:
+        df = df[df['Time'] >= t_min].copy().reset_index(drop=True)
+        print(f"  [测试] 取 t>={t_min}s，共 {len(df)} 行")
 
     # ---- 单位换算 ----
     df['AccX_g']         = df['AccXRaw']
@@ -535,10 +549,10 @@ def main():
     calib_dfs = load_calibration_dataset(DATA_DIR_CALIB)
     all_dfs.extend(calib_dfs)
 
-    # 2. 260316 真实数据
-    print("\n[2/4] 加载 260316 真实路跑数据...")
+    # 2. 260316 真实数据（只用训练段，测试段单独保存）
+    print("\n[2/4] 加载 260316 真实路跑数据（训练段）...")
     if DATA_CSV_REAL.exists():
-        real_dfs = load_real_dataset(DATA_CSV_REAL)
+        real_dfs = load_real_dataset(DATA_CSV_REAL, t_max=REAL_TRAIN_T_MAX)
         all_dfs.extend(real_dfs)
     else:
         print(f"  [SKIP] {DATA_CSV_REAL} 不存在")
@@ -597,6 +611,34 @@ def main():
     print(f"  dy 标签: μ={Y_all[:,1].mean():.4f}  σ={Y_all[:,1].std():.4f}"
           f"  range=[{Y_all[:,1].min():.3f}, {Y_all[:,1].max():.3f}]")
     print("=" * 70)
+
+    # ---- 生成测试集（260316 最后一段，训练时从未见过） ----
+    print("\n[测试集] 处理 260316 测试段 (t >= {:.0f}s)...".format(REAL_TEST_T_START))
+    if DATA_CSV_REAL.exists():
+        test_dfs = load_real_dataset(DATA_CSV_REAL, t_min=REAL_TEST_T_START)
+        test_dfs = [clean_label_outliers(df) for df in test_dfs]
+        test_dfs_normed = [normalize_df(df.copy(), norm_stats) for df in test_dfs]
+        X_test_parts, Y_test_parts, ts_test_parts = [], [], []
+        for df in test_dfs_normed:
+            Xt, Yt, tst = create_windows(df, WINDOW_SIZE, WINDOW_STRIDE)
+            if len(Xt) > 0:
+                X_test_parts.append(Xt)
+                Y_test_parts.append(Yt)
+                ts_test_parts.append(tst)
+        if X_test_parts:
+            X_test = np.concatenate(X_test_parts)
+            Y_test = np.concatenate(Y_test_parts)
+            ts_test = np.concatenate(ts_test_parts)
+            np.save(OUTPUT_DIR / "X_test.npy",  X_test)
+            np.save(OUTPUT_DIR / "Y_test.npy",  Y_test)
+            np.save(OUTPUT_DIR / "ts_test.npy", ts_test)
+            # 保存测试集的对齐 CSV（含 ENU 坐标，用于轨迹可视化）
+            pd.concat(test_dfs, ignore_index=True).to_csv(
+                OUTPUT_DIR / "test_aligned.csv", index=False)
+            print(f"  X_test: {X_test.shape}")
+            print(f"  Y_test: {Y_test.shape}")
+            print(f"  test_aligned.csv 已保存（含 ENU 坐标）")
+
     return X_all, Y_all, ts_all
 
 
