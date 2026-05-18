@@ -1,0 +1,31 @@
+{
+  "model_name": "TCN_ResidualPredictor_INT8",
+  "quantization_type": "DYNAMIC_INT8",
+  "input_shape": [
+    1,
+    20,
+    9
+  ],
+  "input_dtype": "<class 'numpy.int8'>",
+  "input_quantization": {
+    "scale": 0.05670245364308357,
+    "zero_point": 3
+  },
+  "output_shape": [
+    1,
+    2
+  ],
+  "output_dtype": "<class 'numpy.int8'>",
+  "output_quantization": {
+    "scale": 0.01247970201075077,
+    "zero_point": 0
+  },
+  "model_parameters": 218274,
+  "estimated_flops": 4365480,
+  "estimated_latency_ms": 2.0,
+  "inference_frequency_hz": ">300",
+  "target_hardware": "S32K5_NPU_eIQ_Neutron",
+  "output_files": [
+    "model_int8.tflite"
+  ]
+}
