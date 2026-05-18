@@ -35,9 +35,15 @@ VEH_SPD_RAW_FACTOR = 260.63    # VehSpdRaw / factor = km/h
 GPS_MAX_SPEED_KMH  = 150.0     # GPS 跳点速度阈值
 MIN_SPEED_MS       = 0.5       # 低于此速度不计算 GPS 航向
 
-# 260316 按时间切分：前段训练，后段验证（验证段与 validate_trajectory 一致）
-TRAIN_SPLIT_T     = 490.0      # 训练时间上限（秒）
-REAL_TEST_T_START = 620.0      # 验证集起始（秒），held-out
+# 标定实车数据划分：Data01 → 训练+测试，Data02 → 验证（held-out）
+CALIB_TRAIN_ID      = "Data01"
+CALIB_VAL_ID        = "Data02"
+DATA01_TEST_RATIO   = 0.2      # Data01 末段 20% 时间作测试
+
+# 可选：260316 路跑（默认关闭，改用标定数据）
+USE_260316          = False
+TRAIN_SPLIT_T       = 490.0
+REAL_TEST_T_START   = 620.0
 
 EARTH_A    = 6378137.0
 EARTH_E2   = 0.00669437999014132
@@ -208,9 +214,20 @@ def dead_reckoning_nhc(t_arr, v_ms, heading_rad):
 # 加载标定实车数据（Data01 / Data02）
 # ============================================================================
 
-def load_calibration_dataset(data_dir):
+def split_df_by_time(df, test_ratio=DATA01_TEST_RATIO):
+    """按时间前 (1-ratio) 训练、后 ratio 测试，避免随机窗泄漏。"""
+    t0, t1 = float(df['Time_s'].iloc[0]), float(df['Time_s'].iloc[-1])
+    t_cut = t0 + (1.0 - test_ratio) * (t1 - t0)
+    train = df[df['Time_s'] < t_cut].copy().reset_index(drop=True)
+    test = df[df['Time_s'] >= t_cut].copy().reset_index(drop=True)
+    return train, test, t_cut
+
+
+def load_calibration_dataset(data_dir, dataset_ids=None):
+    if dataset_ids is None:
+        dataset_ids = [CALIB_TRAIN_ID, CALIB_VAL_ID]
     datasets = []
-    for ds_id in ["Data01", "Data02"]:
+    for ds_id in dataset_ids:
         imu_f   = data_dir / f"{ds_id}_IMU.txt"
         spd_f   = data_dir / f"{ds_id}_VehicleSpeed.txt"
         gps_f   = data_dir / f"{ds_id}_GNSS.txt"
@@ -301,6 +318,7 @@ def load_calibration_dataset(data_dir):
             rec['GPS_valid']   = gps_ok.astype(int)
 
             df_out = pd.DataFrame(rec)
+            df_out['dataset_id'] = ds_id
             datasets.append(df_out)
             print(f"  [{ds_id}] OK: {len(df_out)} 行, "
                   f"速度 {v_ms.mean()*3.6:.1f} km/h avg, "
@@ -627,105 +645,142 @@ def create_windows_with_tunnel(df, window_size, stride, norm_stats):
 # 主流程
 # ============================================================================
 
+def df_to_trajectory_seq(df):
+    """供 trajectory_data / 融合推理使用的序列 dict。"""
+    imu_raw = np.stack([
+        df['AccX_g'].values, df['AccY_g'].values, df['AccZ_g'].values,
+        df['GyroX_degs'].values, df['GyroY_degs'].values, df['GyroZ_degs'].values,
+    ], axis=1).astype(np.float32)
+    v_ms = df['VehicleSpeed_ms'].values.astype(np.float32)
+    return {
+        'Time_s': df['Time_s'].values.astype(np.float32),
+        'imu_raw': imu_raw,
+        'gyro_z_rad': imu_raw[:, 5] * DEG2RAD,
+        'v_ms': v_ms,
+        'gps_theta': df['Heading_rad'].values.astype(np.float32),
+        'gps_valid': df['GPS_valid'].values.astype(bool),
+        'enu_x_truth': df['ENU_x'].values.astype(np.float32),
+        'enu_y_truth': df['ENU_y'].values.astype(np.float32),
+        'dataset_id': df['dataset_id'].iloc[0] if 'dataset_id' in df.columns else '',
+    }
+
+
 def main():
-    print("=" * 70)
-    print("数据预处理 V2 —— 企业级 GPS 失联定位")
-    print("=" * 70)
-
-    all_dfs = []
-
-    # 1. 260316 训练段（标定数据 IMU 统计差异太大，不混用）
-    print("\n[1/3] 加载 260316 真实路跑数据（训练段 t<{:.0f}s）...".format(TRAIN_SPLIT_T))
-    if DATA_CSV_REAL.exists():
-        real_dfs = load_real_dataset(DATA_CSV_REAL, t_max=TRAIN_SPLIT_T)
-        all_dfs.extend(real_dfs)
-    else:
-        raise RuntimeError(f"{DATA_CSV_REAL} 不存在")
-
-    if not all_dfs:
-        raise RuntimeError("没有加载任何数据！")
-
-    # 2. 标签大跳点二次清洗
-    print("\n[2/3] 标签大跳点清洗...")
-    all_dfs = [clean_label_outliers(df) for df in all_dfs]
-
-    # 3. 归一化
-    print("\n[3/3] 计算归一化统计量（260316 训练段）...")
-    norm_stats = compute_norm_stats(all_dfs)
-
-    # 5. 归一化 + 滑动窗口
-    X_parts, Y_parts, ts_parts = [], [], []
-    for df in all_dfs:
-        df = normalize_df(df, norm_stats)
-        X_, Y_, ts_ = create_windows_with_tunnel(
-            df, WINDOW_SIZE, WINDOW_STRIDE, norm_stats)
-        if len(X_) > 0:
-            X_parts.append(X_)
-            Y_parts.append(Y_)
-            ts_parts.append(ts_)
-        print(f"     => {len(X_)} 个训练窗口")
-
-    X_all = np.concatenate(X_parts, axis=0)
-    Y_all = np.concatenate(Y_parts, axis=0)
-    ts_all = np.concatenate(ts_parts, axis=0)
-
-    # 6. 保存
-    np.save(OUTPUT_DIR / "X_train.npy", X_all)
-    np.save(OUTPUT_DIR / "Y_train.npy", Y_all)
-    np.save(OUTPUT_DIR / "timestamps.npy", ts_all)
-
     import json
+
+    print("=" * 70)
+    print("数据预处理 V2 —— 标定实车 Data01 训练/测试 + Data02 验证")
+    print("=" * 70)
+
+    # ---- 1. Data01 ----
+    print(f"\n[1/4] 加载 {CALIB_TRAIN_ID}（训练+测试）...")
+    d01_list = load_calibration_dataset(DATA_DIR_CALIB, [CALIB_TRAIN_ID])
+    if not d01_list:
+        raise RuntimeError(f"{CALIB_TRAIN_ID} 加载失败，请检查 标定实车数据/ 下 IMU/GNSS/车速 文件")
+    df01 = clean_label_outliers(d01_list[0])
+    df01_train, df01_test, t_cut = split_df_by_time(df01)
+    print(f"  时间切分 t<{t_cut:.1f}s → 训练 {len(df01_train)} 行, "
+          f"t>={t_cut:.1f}s → 测试 {len(df01_test)} 行")
+
+    # ---- 2. Data02 验证 ----
+    print(f"\n[2/4] 加载 {CALIB_VAL_ID}（验证，不参与训练）...")
+    d02_list = load_calibration_dataset(DATA_DIR_CALIB, [CALIB_VAL_ID])
+    if not d02_list:
+        raise RuntimeError(f"{CALIB_VAL_ID} 加载失败")
+    df02 = clean_label_outliers(d02_list[0])
+    print(f"  验证段 {len(df02)} 行, GPS有效 {df02['GPS_valid'].mean():.1%}")
+
+    # ---- 3. 归一化（仅用 Data01 训练段统计）----
+    print("\n[3/4] 归一化统计量（仅 Data01 训练段）...")
+    norm_stats = compute_norm_stats([df01_train])
+
+    def make_windows(dfs, tunnel_aug=False):
+        Xp, Yp, tsp = [], [], []
+        for df in dfs:
+            dfn = normalize_df(df.copy(), norm_stats)
+            if tunnel_aug:
+                X_, Y_, ts_ = create_windows_with_tunnel(
+                    dfn, WINDOW_SIZE, WINDOW_STRIDE, norm_stats)
+            else:
+                X_, Y_, ts_ = create_windows(dfn, WINDOW_SIZE, WINDOW_STRIDE)
+            if len(X_) > 0:
+                Xp.append(X_); Yp.append(Y_); tsp.append(ts_)
+        if not Xp:
+            return np.empty((0, WINDOW_SIZE, len(FEATURE_COLS))), \
+                   np.empty((0, 2)), np.empty((0,))
+        return np.concatenate(Xp), np.concatenate(Yp), np.concatenate(tsp)
+
+    print("  生成训练窗（Data01 训练段 + 隧道增强）...")
+    X_train, Y_train, ts_train = make_windows([df01_train], tunnel_aug=True)
+    print(f"    => {len(X_train)} 窗")
+
+    print("  生成测试窗（Data01 测试段）...")
+    X_test, Y_test, ts_test = make_windows([df01_test], tunnel_aug=False)
+    print(f"    => {len(X_test)} 窗")
+
+    print("  生成验证窗（Data02 整段）...")
+    X_val, Y_val, ts_val = make_windows([df02], tunnel_aug=False)
+    print(f"    => {len(X_val)} 窗")
+
+    if len(X_train) == 0:
+        raise RuntimeError("训练窗口为 0，请检查 GPS 有效段是否过短")
+
+    # ---- 4. 保存 ----
+    print("\n[4/4] 保存...")
+    np.save(OUTPUT_DIR / "X_train.npy", X_train)
+    np.save(OUTPUT_DIR / "Y_train.npy", Y_train)
+    np.save(OUTPUT_DIR / "timestamps.npy", ts_train)
+    np.save(OUTPUT_DIR / "X_test.npy", X_test)
+    np.save(OUTPUT_DIR / "Y_test.npy", Y_test)
+    np.save(OUTPUT_DIR / "ts_test.npy", ts_test)
+    np.save(OUTPUT_DIR / "X_val.npy", X_val)
+    np.save(OUTPUT_DIR / "Y_val.npy", Y_val)
+    np.save(OUTPUT_DIR / "ts_val.npy", ts_val)
+
+    split_info = {
+        'train_dataset': CALIB_TRAIN_ID,
+        'train_time': [float(df01_train['Time_s'].iloc[0]),
+                       float(df01_train['Time_s'].iloc[-1])],
+        'test_dataset': CALIB_TRAIN_ID,
+        'test_time': [float(df01_test['Time_s'].iloc[0]),
+                      float(df01_test['Time_s'].iloc[-1])],
+        'val_dataset': CALIB_VAL_ID,
+        'val_time': [float(df02['Time_s'].iloc[0]),
+                     float(df02['Time_s'].iloc[-1])],
+        'data01_test_ratio': DATA01_TEST_RATIO,
+        'use_260316': USE_260316,
+    }
+    with open(OUTPUT_DIR / "dataset_split.json", 'w', encoding='utf-8') as f:
+        json.dump(split_info, f, indent=2, ensure_ascii=False)
+
     with open(OUTPUT_DIR / "normalization_stats.json", 'w') as f:
         json.dump({
-            'stats':        norm_stats,
+            'stats': norm_stats,
             'feature_names': [f'{c}_norm' for c in FEATURE_COLS],
-            'window_size':  WINDOW_SIZE,
-            'target_freq':  TARGET_FREQ,
+            'window_size': WINDOW_SIZE,
+            'target_freq': TARGET_FREQ,
+            'split': split_info,
         }, f, indent=2)
 
-    # 保存合并的对齐数据（可选，用于分析）
-    pd.concat(all_dfs, ignore_index=True).to_csv(
+    pd.concat([df01_train, df01_test], ignore_index=True).to_csv(
         OUTPUT_DIR / "aligned_data.csv", index=False)
+    df02.to_csv(OUTPUT_DIR / "val_aligned.csv", index=False)
 
     print()
     print("=" * 70)
-    print(f"预处理完成！")
-    print(f"  X_train: {X_all.shape}  (样本, 时间步={WINDOW_SIZE}, 特征=9)")
-    print(f"  Y_train: {Y_all.shape}")
-    print(f"  dx 标签: μ={Y_all[:,0].mean():.4f}  σ={Y_all[:,0].std():.4f}"
-          f"  range=[{Y_all[:,0].min():.3f}, {Y_all[:,0].max():.3f}]")
-    print(f"  dy 标签: μ={Y_all[:,1].mean():.4f}  σ={Y_all[:,1].std():.4f}"
-          f"  range=[{Y_all[:,1].min():.3f}, {Y_all[:,1].max():.3f}]")
+    print("预处理完成！")
+    print(f"  X_train ({CALIB_TRAIN_ID} 训练): {X_train.shape}")
+    print(f"  X_test  ({CALIB_TRAIN_ID} 测试): {X_test.shape}")
+    print(f"  X_val   ({CALIB_VAL_ID} 验证):   {X_val.shape}")
+    print(f"  dataset_split.json / val_aligned.csv 已保存")
     print("=" * 70)
 
-    # ---- 生成验证集（260316 后 30%，训练时从未见过） ----
-    print("\n[验证集] 处理 260316 验证段 (t >= {:.0f}s)...".format(REAL_TEST_T_START))
-    if DATA_CSV_REAL.exists():
-        test_dfs = load_real_dataset(DATA_CSV_REAL, t_min=REAL_TEST_T_START)
-        test_dfs = [clean_label_outliers(df) for df in test_dfs]
-        test_dfs_normed = [normalize_df(df.copy(), norm_stats) for df in test_dfs]
-        X_test_parts, Y_test_parts, ts_test_parts = [], [], []
-        for df in test_dfs_normed:
-            Xt, Yt, tst = create_windows(df, WINDOW_SIZE, WINDOW_STRIDE)
-            if len(Xt) > 0:
-                X_test_parts.append(Xt)
-                Y_test_parts.append(Yt)
-                ts_test_parts.append(tst)
-        if X_test_parts:
-            X_test = np.concatenate(X_test_parts)
-            Y_test = np.concatenate(Y_test_parts)
-            ts_test = np.concatenate(ts_test_parts)
-            np.save(OUTPUT_DIR / "X_test.npy",  X_test)
-            np.save(OUTPUT_DIR / "Y_test.npy",  Y_test)
-            np.save(OUTPUT_DIR / "ts_test.npy", ts_test)
-            # 保存测试集的对齐 CSV（含 ENU 坐标，用于轨迹可视化）
-            pd.concat(test_dfs, ignore_index=True).to_csv(
-                OUTPUT_DIR / "test_aligned.csv", index=False)
-            print(f"  X_test: {X_test.shape}")
-            print(f"  Y_test: {Y_test.shape}")
-            print(f"  test_aligned.csv 已保存（含 ENU 坐标）")
+    # 可选 260316
+    if USE_260316 and DATA_CSV_REAL.exists():
+        print("\n[可选] 附加 260316 数据（USE_260316=True）...")
+        # 保留旧逻辑时可在此扩展
 
-    return X_all, Y_all, ts_all
+    return X_train, Y_train, ts_train
 
 
 if __name__ == "__main__":

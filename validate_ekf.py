@@ -95,6 +95,22 @@ def clean_gps_outliers(t, lat, lon, max_kmh=150.0):
 # 加载测试段数据
 # ============================================================================
 
+def _seq_from_calibration(cseq):
+    """将 trajectory_data.load_calibration_segment 输出转为 validate_ekf 格式。"""
+    gps_v = cseq['gps_valid']
+    return {
+        'Time_s': cseq['Time_s'],
+        'imu_raw': cseq['imu_raw'],
+        'gyro_z_rad': cseq['gyro_z_rad'],
+        'v_ms': cseq['v_ms'],
+        'gps_theta': cseq['gps_theta'],
+        'gps_valid': gps_v,
+        'gps_valid_full': gps_v.copy(),
+        'enu_x_truth': cseq['enu_x_truth'],
+        'enu_y_truth': cseq['enu_y_truth'],
+    }
+
+
 def load_test_segment():
     print(f"[数据] 加载测试段 (t >= {REAL_TEST_T_START} s) ...")
     df = pd.read_csv(DATA_CSV)
@@ -399,11 +415,16 @@ def plot_results(seq, dr_x, dr_y, dr_h,
 
 def main():
     print("=" * 55)
-    print("EKF 导航器验证（测试集：260316_Data t>=620s）")
+    print("EKF 导航器验证（默认 Data02 标定验证集）")
     print("=" * 55)
 
     # 1. 加载测试数据
-    seq = load_test_segment()
+    try:
+        from trajectory_data import load_calibration_segment, VAL_DATASET_ID
+        print(f"[数据] 加载标定验证集 {VAL_DATASET_ID} ...")
+        seq = _seq_from_calibration(load_calibration_segment(VAL_DATASET_ID))
+    except Exception:
+        seq = load_test_segment()
 
     # 2. 模拟 GPS 丢失掩码
     print("\n[1] 设置模拟 GPS 丢失...")

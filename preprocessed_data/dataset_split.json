@@ -1,0 +1,19 @@
+{
+  "train_dataset": "Data01",
+  "train_time": [
+    0.0644,
+    250.8644
+  ],
+  "test_dataset": "Data01",
+  "test_time": [
+    250.96439999999998,
+    313.5644
+  ],
+  "val_dataset": "Data02",
+  "val_time": [
+    0.0592,
+    291.1592
+  ],
+  "data01_test_ratio": 0.2,
+  "use_260316": false
+}

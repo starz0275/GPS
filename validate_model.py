@@ -1,6 +1,7 @@
 """
-模型验证脚本 —— 真实测试集（从未参与训练）
-使用 260316_Data.csv t>=620s 段，完整评估模型泛化能力。
+模型验证脚本 —— TCN 残差评估
+  X_val / Y_val：Data02（验证集，训练时未见过）
+  X_test / Y_test：Data01 末段 20%（同数据集留出测试）
 绘制：
   1. 预测 vs 真实 残差散点
   2. 误差分布直方图
@@ -22,9 +23,11 @@ keras.config.enable_unsafe_deserialization()
 
 MODEL_PATH  = Path(__file__).parent / "trained_models" / "best_model.keras"
 NORM_PATH   = Path(__file__).parent / "preprocessed_data" / "normalization_stats.json"
+X_VAL       = Path(__file__).parent / "preprocessed_data" / "X_val.npy"
+Y_VAL       = Path(__file__).parent / "preprocessed_data" / "Y_val.npy"
 X_TEST      = Path(__file__).parent / "preprocessed_data" / "X_test.npy"
 Y_TEST      = Path(__file__).parent / "preprocessed_data" / "Y_test.npy"
-TS_TEST     = Path(__file__).parent / "preprocessed_data" / "ts_test.npy"
+VAL_CSV     = Path(__file__).parent / "preprocessed_data" / "val_aligned.csv"
 TEST_CSV    = Path(__file__).parent / "preprocessed_data" / "test_aligned.csv"
 OUT_DIR     = Path(__file__).parent / "trained_models"
 
@@ -33,30 +36,33 @@ TARGET_FREQ = 10
 
 def main():
     print("=" * 65)
-    print("TCN Model Evaluation — Held-out Test Set (t >= 620s)")
+    print("TCN Model Evaluation — Data02 val / Data01 test")
     print("=" * 65)
 
-    # ---- 加载 ----
-    model  = tf.keras.models.load_model(MODEL_PATH, safe_mode=False, compile=False)
-    X_test = np.load(X_TEST)
-    Y_test = np.load(Y_TEST)
-    ts     = np.load(TS_TEST)
+    model = tf.keras.models.load_model(MODEL_PATH, safe_mode=False, compile=False)
 
-    print(f"Test set: {len(X_test)} windows  shape={X_test.shape}")
+    if X_VAL.exists():
+        X_eval, Y_eval, tag = np.load(X_VAL), np.load(Y_VAL), "Data02 验证"
+    else:
+        X_eval, Y_eval, tag = np.load(X_TEST), np.load(Y_TEST), "Data01 测试"
+    print(f"{tag}: {len(X_eval)} windows  shape={X_eval.shape}")
 
-    # ---- 推理 ----
-    Y_pred = model.predict(X_test, batch_size=64, verbose=0)
-    err_dx = Y_pred[:, 0] - Y_test[:, 0]
-    err_dy = Y_pred[:, 1] - Y_test[:, 1]
+    Y_pred = model.predict(X_eval, batch_size=64, verbose=0)
+    err_dx = Y_pred[:, 0] - Y_eval[:, 0]
+    err_dy = Y_pred[:, 1] - Y_eval[:, 1]
 
     print(f"dx: MAE={np.abs(err_dx).mean():.4f}m  RMSE={np.sqrt((err_dx**2).mean()):.4f}m  "
           f"p50={np.percentile(np.abs(err_dx),50):.4f}  p90={np.percentile(np.abs(err_dx),90):.4f}")
     print(f"dy: MAE={np.abs(err_dy).mean():.4f}m  RMSE={np.sqrt((err_dy**2).mean()):.4f}m  "
           f"p50={np.percentile(np.abs(err_dy),50):.4f}  p90={np.percentile(np.abs(err_dy),90):.4f}")
 
-    # ---- 加载对齐 CSV 做轨迹重建 ----
-    df = pd.read_csv(TEST_CSV)
-    df = df[df['GPS_valid'] == 1].reset_index(drop=True)   # 只用 GPS 有效行
+    csv_path = VAL_CSV if VAL_CSV.exists() else TEST_CSV
+    ts_path = Path(__file__).parent / "preprocessed_data" / (
+        "ts_val.npy" if VAL_CSV.exists() else "ts_test.npy")
+    ts = np.load(ts_path) if ts_path.exists() else np.arange(len(Y_eval))
+
+    df = pd.read_csv(csv_path)
+    df = df[df['GPS_valid'] == 1].reset_index(drop=True)
 
     # GPS ENU 真值轨迹（累积真实位移）
     gps_x = np.cumsum(df['True_dx'].values)
@@ -87,15 +93,15 @@ def main():
     # ======== 绘图 ========
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
-        "TCN Validation — Held-out Test Set (260316, t≥620s, never seen in training)",
+        f"TCN Validation — {tag}",
         fontsize=12, fontweight='bold')
 
     # ---- 左上：dx 散点 ----
     ax = axes[0, 0]
-    lim = float(np.percentile(np.abs(Y_test[:, 0]), 95))
-    ax.scatter(Y_test[:, 0], Y_pred[:, 0], alpha=0.3, s=6, c='steelblue')
+    lim = float(np.percentile(np.abs(Y_eval[:, 0]), 95))
+    ax.scatter(Y_eval[:, 0], Y_pred[:, 0], alpha=0.3, s=6, c='steelblue')
     ax.plot([-lim, lim], [-lim, lim], 'r--', lw=1.5, label='Perfect')
-    r2_dx = 1 - float(np.var(err_dx)) / (float(np.var(Y_test[:, 0])) + 1e-9)
+    r2_dx = 1 - float(np.var(err_dx)) / (float(np.var(Y_eval[:, 0])) + 1e-9)
     ax.set_xlim(-lim, lim);  ax.set_ylim(-lim, lim)
     ax.set_xlabel('True residual dx (m)');  ax.set_ylabel('Predicted dx (m)')
     ax.set_title('dx: Predicted vs True  [Test Set]')
@@ -107,10 +113,10 @@ def main():
 
     # ---- 右上：dy 散点 ----
     ax = axes[0, 1]
-    lim = float(np.percentile(np.abs(Y_test[:, 1]), 95))
-    ax.scatter(Y_test[:, 1], Y_pred[:, 1], alpha=0.3, s=6, c='darkorange')
+    lim = float(np.percentile(np.abs(Y_eval[:, 1]), 95))
+    ax.scatter(Y_eval[:, 1], Y_pred[:, 1], alpha=0.3, s=6, c='darkorange')
     ax.plot([-lim, lim], [-lim, lim], 'r--', lw=1.5, label='Perfect')
-    r2_dy = 1 - float(np.var(err_dy)) / (float(np.var(Y_test[:, 1])) + 1e-9)
+    r2_dy = 1 - float(np.var(err_dy)) / (float(np.var(Y_eval[:, 1])) + 1e-9)
     ax.set_xlim(-lim, lim);  ax.set_ylim(-lim, lim)
     ax.set_xlabel('True residual dy (m)');  ax.set_ylabel('Predicted dy (m)')
     ax.set_title('dy: Predicted vs True  [Test Set]')

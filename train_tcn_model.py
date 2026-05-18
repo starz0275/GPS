@@ -105,20 +105,25 @@ def build_tcn_model(input_shape):
 
 def load_and_split_data():
     print("[Data] 读取预处理数据...")
-    X = np.load(OUTPUT_DIR / "X_train.npy")
-    Y = np.load(OUTPUT_DIR / "Y_train.npy")
+    X_tr = np.load(OUTPUT_DIR / "X_train.npy")
+    Y_tr = np.load(OUTPUT_DIR / "Y_train.npy")
+    val_path = OUTPUT_DIR / "X_val.npy"
 
     with open(OUTPUT_DIR / "normalization_stats.json") as f:
         config = json.load(f)
 
-    print(f"  样本: {len(X)}  形状: {X.shape}")
+    if val_path.exists():
+        X_val = np.load(val_path)
+        Y_val = np.load(OUTPUT_DIR / "Y_val.npy")
+        print(f"  训练: {len(X_tr)} 窗 (Data01)  验证: {len(X_val)} 窗 (Data02 held-out)")
+        return X_tr, Y_tr, X_val, Y_val, config
 
+    print(f"  训练样本: {len(X_tr)}（无 X_val.npy，回退随机 {VAL_SPLIT:.0%} 划分）")
     np.random.seed(RANDOM_SEED)
-    idx = np.random.permutation(len(X))
-    X, Y = X[idx], Y[idx]
-
-    split = int(len(X) * (1 - VAL_SPLIT))
-    return X[:split], Y[:split], X[split:], Y[split:], config
+    idx = np.random.permutation(len(X_tr))
+    X_tr, Y_tr = X_tr[idx], Y_tr[idx]
+    split = int(len(X_tr) * (1 - VAL_SPLIT))
+    return X_tr[:split], Y_tr[:split], X_tr[split:], Y_tr[split:], config
 
 
 # ============================================================================
@@ -127,7 +132,7 @@ def load_and_split_data():
 
 def train_model():
     print("=" * 70)
-    print("1D-TCN 训练 V2（Huber 损失 + 双数据源）")
+    print("1D-TCN 训练 V2（Data01 训练 / Data02 验证）")
     print("=" * 70)
 
     X_tr, Y_tr, X_val, Y_val, config = load_and_split_data()

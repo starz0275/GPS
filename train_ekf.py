@@ -359,31 +359,33 @@ def main():
     print("BiasNet 训练：陀螺 Z 轴零偏预测")
     print("=" * 60)
 
-    # 1. 加载数据（仅用 260316 训练段）
-    print("\n[1] 加载数据 ...")
-    seqs = load_real_seq(DATA_CSV_REAL, t_max=TRAIN_SPLIT_T) if DATA_CSV_REAL.exists() else []
-    if not seqs:
-        raise RuntimeError("未找到任何训练数据，请先运行 data_preprocessing_v2.py")
+    # 1. 加载数据：Data01 训练，Data02 作 fit 验证
+    print("\n[1] 加载数据 (Data01 训练 / Data02 验证) ...")
+    seqs_tr = load_calibration_seq(DATA_DIR_CALIB)
+    seqs_tr = [s for s in seqs_tr if s.get('id', '').startswith('Data01')]
+    seqs_val = load_calibration_seq(DATA_DIR_CALIB)
+    seqs_val = [s for s in seqs_val if s.get('id', '').startswith('Data02')]
+    if not seqs_tr:
+        raise RuntimeError("未找到 Data01，请先运行 data_preprocessing_v2.py")
 
     # 2. 归一化统计量
     print("\n[2] 准备归一化参数 ...")
-    mu, std, stats = load_or_compute_norm(seqs, NORM_JSON)
+    mu, std, stats = load_or_compute_norm(seqs_tr, NORM_JSON)
 
     # 3. 构造训练样本
     print("\n[3] 构造训练样本 ...")
-    X, Y = build_samples(seqs, mu, std)
-    print(f"  样本总量: {len(X)}")
-    print(f"  零偏标签  均值={Y.mean()*RAD2DEG:.4f} deg/s  "
-          f"std={Y.std()*RAD2DEG:.4f} deg/s  "
-          f"max={np.abs(Y).max()*RAD2DEG:.4f} deg/s")
-
-    # 打乱并分割
-    idx = np.random.permutation(len(X))
-    n_val = max(1, int(0.15 * len(X)))
-    val_idx, train_idx = idx[:n_val], idx[n_val:]
-    X_tr, Y_tr = X[train_idx], Y[train_idx]
-    X_val, Y_val = X[val_idx], Y[val_idx]
-    print(f"  训练集: {len(X_tr)}  验证集: {len(X_val)}")
+    X_tr, Y_tr = build_samples(seqs_tr, mu, std)
+    print(f"  Data01 训练样本: {len(X_tr)}")
+    if seqs_val:
+        X_val, Y_val = build_samples(seqs_val, mu, std)
+        print(f"  Data02 验证样本: {len(X_val)}")
+    else:
+        idx = np.random.permutation(len(X_tr))
+        n_val = max(1, int(0.15 * len(X_tr)))
+        X_val, Y_val = X_tr[idx[:n_val]], Y_tr[idx[:n_val]]
+        X_tr, Y_tr = X_tr[idx[n_val:]], Y_tr[idx[n_val:]]
+    print(f"  零偏标签  均值={Y_tr.mean()*RAD2DEG:.4f} deg/s  "
+          f"std={Y_tr.std()*RAD2DEG:.4f} deg/s")
 
     # 4. 构建模型
     print("\n[4] 构建 BiasNet ...")
