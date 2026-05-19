@@ -320,6 +320,7 @@ def _align_origin(truth_x, truth_y, pred_x, pred_y, ref_idx):
 
 def plot_results(seq, dr_x, dr_y, dr_h,
                  ekf_x, ekf_y, ekf_h, net_bias, ekf_bg,
+                 ekf_vx, ekf_vy,
                  loss_start_idx=None, loss_end_idx=None,
                  metrics_dr=None, metrics_ekf=None):
     tg = seq['Time_s']
@@ -335,6 +336,12 @@ def plot_results(seq, dr_x, dr_y, dr_h,
     idx_v = np.where(eval_mask)[0]
     dr_err = np.sqrt((drx[idx_v] - tx[idx_v]) ** 2 + (dry[idx_v] - ty[idx_v]) ** 2)
     ekf_err = np.sqrt((ex[idx_v] - tx[idx_v]) ** 2 + (ey[idx_v] - ty[idx_v]) ** 2)
+
+    # —— 车体速度 & 横向速度（用于子图 d）——
+    ekf_spd = np.sqrt(ekf_vx ** 2 + ekf_vy ** 2)
+    v_lat = np.zeros(len(tg), np.float32)
+    for k in range(len(tg)):
+        _, v_lat[k] = enu_to_body(float(ekf_vx[k]), float(ekf_vy[k]), float(ekf_h[k]))
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle('GNSS/INS/Wheel 6-State EKF 验证', fontsize=14, fontweight='bold')
@@ -391,16 +398,29 @@ def plot_results(seq, dr_x, dr_y, dr_h,
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.35)
 
-    # (d) 零偏：BiasNet vs EKF 残余
+    # (d) 速度诊断（原零偏估计替换）
     ax = axes[1, 1]
-    ax.plot(t_rel, net_bias * RAD2DEG, 'g-', lw=1.0, label='BiasNet 预测')
-    ax.plot(t_rel, ekf_bg * RAD2DEG, 'b-', lw=1.0, alpha=0.8, label='EKF 残余 bg')
-    ax.axhline(0, color='k', ls='--', lw=0.6)
+    ax.plot(t_rel, seq['v_ms'], 'g-', lw=1.0, alpha=0.7, label='Wheel speed')
+    ax.plot(t_rel, ekf_spd, 'b-', lw=1.2, label='EKF speed (√(vx²+vy²))')
+    ax.plot(t_rel, v_lat, 'r-', lw=0.8, alpha=0.6, label='v_lat (body)')
+    ax.axhline(0, color='k', ls='--', lw=0.4)
+    if loss_start_idx is not None:
+        ax.axvspan(t_rel[loss_start_idx], t_rel[min(loss_end_idx, len(t_rel) - 1)],
+                   alpha=0.08, color='orange')
     ax.set_xlabel('时间 (s)')
-    ax.set_ylabel('陀螺 Z 零偏 (°/s)')
-    ax.set_title('零偏估计')
-    ax.legend(fontsize=8)
+    ax.set_ylabel('速度 (m/s)')
+    ax.set_title('速度诊断：EKF speed / Wheel / v_lat')
+    ax.legend(fontsize=8, loc='upper left')
     ax.grid(True, alpha=0.35)
+    # 右侧显示统计
+    stats_text = (
+        f"EKF speed: μ={np.mean(ekf_spd):.2f} σ={np.std(ekf_spd):.2f}\n"
+        f"Wheel    : μ={np.mean(seq['v_ms']):.2f} σ={np.std(seq['v_ms']):.2f}\n"
+        f"v_lat    : μ={np.mean(v_lat):.4f} σ={np.std(v_lat):.3f}  max|.|={np.max(np.abs(v_lat)):.3f}"
+    )
+    ax.text(0.98, 0.97, stats_text, transform=ax.transAxes, fontsize=7.5,
+            verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle='round,pad=0.4', facecolor='wheat', alpha=0.7))
 
     plt.tight_layout()
     out_path = OUTPUT_DIR / 'ekf_validation.png'
@@ -427,74 +447,74 @@ def plot_results(seq, dr_x, dr_y, dr_h,
 
 
 def plot_ekf_diagnostics(seq, vel_x, vel_y, headings, net_bias, loss_start, loss_end):
-    """dt、车体速度、横向速度、BiasNet 限幅后零偏。"""
+    """
+    速度诊断图（Figure 4）
+      - 4A：Speed Magnitude Comparison — wheel speed vs EKF reconstructed speed
+      - 4B：Lateral Velocity Diagnostic — body frame v_lat sanity check
+    """
     tg = seq['Time_s']
-    dt_arr = np.diff(tg, prepend=tg[0])
-    dt_arr[0] = TARGET_DT
     t_rel = tg - tg[0]
 
+    # EKF reconstructed speed
+    ekf_spd = np.sqrt(vel_x ** 2 + vel_y ** 2)
+
+    # Body-frame velocities
     v_fwd = np.zeros(len(tg), np.float32)
     v_lat = np.zeros(len(tg), np.float32)
     for k in range(len(tg)):
         v_fwd[k], v_lat[k] = enu_to_body(float(vel_x[k]), float(vel_y[k]), float(headings[k]))
 
-    # 航向 unwrap 对比（检查跳变）
-    yaw_unwrap = np.unwrap(headings.astype(np.float64))
+    # ======================================================================
+    # Figure 4：速度诊断
+    # ======================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5.5))
+    fig.suptitle('Figure 4：Velocity Diagnostic', fontsize=13, fontweight='bold')
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('EKF 诊断：dt / 车体速度 / 横向速度 / 零偏', fontsize=13, fontweight='bold')
-
-    ax = axes[0, 0]
-    ax.plot(t_rel[1:], dt_arr[1:], 'b.', ms=2, alpha=0.6)
-    ax.axhline(TARGET_DT, color='r', ls='--', label=f'标称 dt={TARGET_DT}s')
-    ax.set_xlabel('时间 (s)')
-    ax.set_ylabel('dt (s)')
-    ax.set_title(f'dt 分布 (median={np.median(dt_arr[1:]):.4f}s)')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.35)
-
-    ax = axes[0, 1]
-    ax.plot(t_rel, v_fwd, 'b-', lw=0.8, label='v_fwd (body)')
-    ax.plot(t_rel, seq['v_ms'], 'g--', lw=0.7, alpha=0.7, label='轮速')
+    # ====== 4A: Speed Magnitude Comparison ======
+    ax = axes[0]
+    ax.plot(t_rel, seq['v_ms'], 'g-', lw=1.2, alpha=0.8, label='Wheel speed (测量)')
+    ax.plot(t_rel, ekf_spd, 'b-', lw=1.2, alpha=0.8, label='EKF speed (√(vx²+vy²))')
     if loss_start is not None:
         ax.axvspan(t_rel[loss_start], t_rel[min(loss_end, len(t_rel) - 1)],
-                   alpha=0.12, color='orange')
-    ax.set_xlabel('时间 (s)')
-    ax.set_ylabel('m/s')
-    ax.set_title('前向速度 vs 轮速')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.35)
+                   alpha=0.1, color='orange', label='GNSS Outage')
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Speed (m/s)')
+    ax.set_title('4A：Speed Magnitude Comparison', fontsize=11)
+    ax.legend(fontsize=9, loc='upper left')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(t_rel[0], t_rel[-1])
 
-    ax = axes[1, 0]
-    ax.plot(t_rel, v_lat, 'r-', lw=0.8)
+    # ====== 4B: Lateral Velocity Diagnostic ======
+    ax = axes[1]
+    ax.plot(t_rel, v_lat, 'r-', lw=1.0)
     ax.axhline(0, color='k', ls='--', lw=0.6)
+    # 固定 y 轴范围防止炸裂
+    vlat_lim = max(np.percentile(np.abs(v_lat), 99) * 1.5, 0.15)
+    ax.set_ylim(-vlat_lim, vlat_lim)
     if loss_start is not None:
         ax.axvspan(t_rel[loss_start], t_rel[min(loss_end, len(t_rel) - 1)],
-                   alpha=0.12, color='orange', label='Outage')
-    ax.set_xlabel('时间 (s)')
+                   alpha=0.1, color='orange', label='GNSS Outage')
+    ax.set_xlabel('Time (s)')
     ax.set_ylabel('v_lat (m/s)')
-    ax.set_title(f'横向速度 (|median|={np.median(np.abs(v_lat)):.3f} m/s)')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.35)
-
-    ax = axes[1, 1]
-    ax.plot(t_rel, net_bias * RAD2DEG, 'g-', lw=0.9, label='BiasNet (tanh±1°/s)')
-    d_yaw = np.diff(yaw_unwrap, prepend=yaw_unwrap[0]) / np.maximum(dt_arr, 1e-3)
-    ax2 = ax.twinx()
-    ax2.plot(t_rel, d_yaw * RAD2DEG, 'b-', lw=0.5, alpha=0.5, label='yaw rate (unwrap)')
-    ax.set_xlabel('时间 (s)')
-    ax.set_ylabel('零偏 (°/s)', color='g')
-    ax2.set_ylabel('航向率 (°/s)', color='b')
-    ax.set_title('零偏 & 航向连续性')
-    ax.grid(True, alpha=0.35)
+    ax.set_title('4B：Lateral Velocity Diagnostic', fontsize=11)
+    ax.legend(fontsize=9, loc='upper left')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(t_rel[0], t_rel[-1])
 
     plt.tight_layout()
     out = OUTPUT_DIR / 'ekf_diagnostics.png'
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"[诊断图] {out}")
-    print(f"  BiasNet |bias|: max={np.max(np.abs(net_bias))*RAD2DEG:.3f} deg/s")
-    print(f"  v_lat   : std={np.std(v_lat):.3f} m/s  max|.|={np.max(np.abs(v_lat)):.3f} m/s")
+
+    # ======================================================================
+    # 统计数据输出
+    # ======================================================================
+    wheel_spd = seq['v_ms']
+    print(f"  EKF speed : mean={np.mean(ekf_spd):.3f} m/s, std={np.std(ekf_spd):.3f} m/s")
+    print(f"  Wheel spd : mean={np.mean(wheel_spd):.3f} m/s, std={np.std(wheel_spd):.3f} m/s")
+    print(f"  v_lat     : mean={np.mean(v_lat):.5f} m/s, std={np.std(v_lat):.3f} m/s, "
+          f"max|.|={np.max(np.abs(v_lat)):.3f} m/s")
 
 
 # ============================================================================
@@ -566,6 +586,7 @@ def main():
     print("\n[4] 绘制结果 ...")
     plot_results(
         seq, dr_x, dr_y, dr_h, ekf_x, ekf_y, ekf_h, net_bias, ekf_bg,
+        ekf_vx, ekf_vy,
         loss_start_idx=loss_start, loss_end_idx=loss_end,
         metrics_dr=metrics_dr, metrics_ekf=metrics_ekf,
     )
