@@ -61,7 +61,7 @@ BATCH_SIZE      = 256
 EPOCHS          = 80
 LR              = 3e-4
 PATIENCE        = 15
-BIAS_SMOOTH_W   = 31          # 零偏平滑窗口（帧），≈3 s
+WINDOW_S_INTEG  = 3.0         # 积分法零偏窗口（秒），替代原 BIAS_SMOOTH_W
 
 TRAIN_SPLIT_T   = 490.0       # 260316 前 70% 用于训练，后 30% 用于验证
 
@@ -257,40 +257,54 @@ def load_real_seq(csv_path, t_max=None):
 # 计算零偏标签
 # ============================================================================
 
-def compute_bias_labels(seq):
+def compute_bias_labels(seq, window_s=3.0):
     """
-    真实零偏 = 陀螺 Z 角速度 − GPS 推算的航向变化率
-    仅在 GPS 有效段计算，其余段用插值填充。
+    用积分法计算零偏（比微分法噪声低一个数量级）:
+      对 N 帧窗口积分航向:
+        Δθ_gps  = θ_gps[i] - θ_gps[i-N]           # GPS 航向变化
+        Δθ_gyro = Σ(gyro_z) * dt                    # 陀螺航向变化
+        bias    = (Δθ_gyro - Δθ_gps) / (N * dt)     # 平均零偏
 
-    返回 bias_labels (T,) [rad/s]，以及 label_valid (T,) bool
+    仅在窗口两端 GPS 有效时标签可信。返回 (T,) [rad/s] 及可信掩码。
     """
     T = len(seq['Time_s'])
-    dt_arr = np.gradient(seq['Time_s'])
-    dt_arr = np.clip(dt_arr, 1e-3, 1.0)
+    dt = float(np.median(np.diff(seq['Time_s'])))  # 典型 dt
+    N = max(1, int(window_s / dt))                 # 积分窗口帧数
+    dt_arr = np.full(T, dt)
 
-    # GPS 航向变化率
-    gps_rate = np.gradient(seq['gps_theta'], seq['Time_s'])
+    gyro_z = seq['gyro_z_rad']                     # (T,) [rad/s]
+    gps_th = seq['gps_theta']                      # (T,) [rad]
+    valid  = seq['gps_valid'].copy()               # 仅 GPS 有效段
 
-    # 瞬时零偏（在 GPS 有效段）
-    bias_inst = seq['gyro_z_rad'] - gps_rate    # (T,) [rad/s]
+    bias_labels = np.zeros(T, dtype=np.float32)
 
-    # 仅 GPS 有效段可信
-    valid = seq['gps_valid'].copy()
+    # 滑动窗口积分
+    gyro_cum = np.cumsum(gyro_z) * dt              # cum heading from gyro
+    for i in range(N, T):
+        if valid[i] and valid[i - N]:              # 窗口两端 GPS 都有效
+            dth_gps = gps_th[i] - gps_th[i - N]
+            dth_gps = np.arctan2(np.sin(dth_gps), np.cos(dth_gps))  # wrap
+            dth_gyro = gyro_cum[i] - gyro_cum[i - N]
+            bias_labels[i] = (dth_gyro - dth_gps) / (N * dt)
 
-    # 在有效段平滑零偏（去除 GPS 微分噪声）
-    bias_smooth = median_filter(bias_inst, size=BIAS_SMOOTH_W)
+    # 有效标签位置
+    label_ok = np.zeros(T, dtype=bool)
+    if N < T:
+        label_ok[N:] = valid[N:] & valid[:-N]
 
-    # 将无效段用线性插值填充（至少要有有效段作为参考）
-    if valid.sum() < 2:
-        return np.zeros(T, np.float32), valid
+    # 无有效标签则返回 0
+    if label_ok.sum() < 2:
+        return bias_labels, label_ok
 
+    # 对有效段做一次轻中值平滑（去除残余毛刺）
+    bias_labels[label_ok] = median_filter(
+        bias_labels[label_ok], size=min(11, max(3, label_ok.sum() // 20)))
+
+    # 对无效段线性插值填充
     idx = np.arange(T)
-    bias_filled = np.interp(idx, idx[valid], bias_smooth[valid])
+    bias_labels_filled = np.interp(idx, idx[label_ok], bias_labels[label_ok])
 
-    # 整体再平滑一次（防止插值带来的抖动）
-    bias_labels = median_filter(bias_filled.astype(np.float32),
-                                size=BIAS_SMOOTH_W * 2 + 1)
-    return bias_labels.astype(np.float32), valid
+    return bias_labels_filled.astype(np.float32), label_ok
 
 
 # ============================================================================

@@ -17,7 +17,12 @@
       "Read(//c/Users/nxj/**)",
       "Read(//c/Users/nxj/AppData/Local/**)",
       "Bash(ls -d /d/*conda*)",
-      "Bash(find /d -maxdepth 4 -name \"traj312\" -type d)"
+      "Bash(find /d -maxdepth 4 -name \"traj312\" -type d)",
+      "Bash(python3 *)",
+      "Bash(conda info *)",
+      "Bash(cmd.exe *)",
+      "Bash(grep -v \"WARNING\\\\|I0000\\\\|tensorflow\\\\|^$\")",
+      "Bash(grep -v \"WARNING\\\\|I0000\\\\|tensorflow\\\\|^$\\\\|config\")"
     ]
   }
 }

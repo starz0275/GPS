@@ -42,7 +42,11 @@ from scipy.ndimage import median_filter
 import json, warnings
 warnings.filterwarnings('ignore')
 
-from ekf_navigator import EKFNavigatorNP, load_norm_stats
+from ekf_navigator import (
+    EKFNavigatorNP, load_norm_stats, simulate_gnss_outage, evaluate_trajectory,
+    enu_to_body, wrap_angle,
+)
+from config import DEFAULT_EKF_CONFIG
 
 # ============================================================================
 # 配置
@@ -210,66 +214,68 @@ def load_test_segment():
     }
 
 
-GPS_LOSS_SIM_SECS = 60.0    # 模拟 GPS 丢失时长（秒）
+GPS_LOSS_SIM_SECS = 90.0    # 模拟 GNSS outage 时长（秒）
+GPS_LOSS_START_S  = 15.0    # 相对段起点，留时间初始化 EKF
 
 
 def simulate_gps_loss(seq, loss_duration_s=GPS_LOSS_SIM_SECS):
-    """
-    在测试段中间屏蔽 GPS 信号（模拟隧道场景），
-    返回修改后的 gps_valid 掩码及丢失区间信息。
-    """
+    """隧道场景：屏蔽 GNSS 位置量测（仅保留 wheel + NHC + INS）。"""
     tg = seq['Time_s']
-    gps_v = seq['gps_valid_full'].copy()
-    T = len(tg)
-
-    # 在距离起点 15s 后开始丢失（留一段用于 EKF 初始化）
-    loss_start_s = 15.0
-    loss_end_s   = loss_start_s + loss_duration_s
-
-    loss_start_idx = np.searchsorted(tg - tg[0], loss_start_s)
-    loss_end_idx   = np.searchsorted(tg - tg[0], loss_end_s)
-    loss_end_idx   = min(loss_end_idx, T - 1)
-
-    gps_v[loss_start_idx: loss_end_idx] = False
-
-    actual_loss_s = (tg[loss_end_idx] - tg[loss_start_idx])
-    print(f"  [模拟 GPS 丢失] 索引 {loss_start_idx}–{loss_end_idx}，"
-          f"持续 {actual_loss_s:.1f} s")
-
-    return gps_v, loss_start_idx, loss_end_idx
+    gps_full = seq.get('gps_valid_full', seq['gps_valid'])
+    # 位置更新需要有效坐标，用完整 GNSS 掩码（非仅航向有效）
+    pos_ok = (
+        gps_full
+        & np.isfinite(seq['enu_x_truth'])
+        & np.isfinite(seq['enu_y_truth'])
+    )
+    gps_v, i0, i1 = simulate_gnss_outage(
+        pos_ok, tg, GPS_LOSS_START_S, GPS_LOSS_START_S + loss_duration_s)
+    print(f"  [模拟 GNSS outage] 索引 {i0}–{i1}，"
+          f"持续 {tg[min(i1, len(tg)-1)] - tg[i0]:.1f} s")
+    return gps_v, i0, i1
 
 
 # ============================================================================
 # 纯死推算（基准）
 # ============================================================================
 
-def run_pure_dr(seq):
+def run_pure_dr(seq, gps_valid_nav=None):
     """
-    纯陀螺积分（无零偏校正） + NHC 位置累积
-    GPS 有效时锚定航向（仅在实际 GPS 有效处更新，模拟无校正情况下的基准）
+    纯陀螺积分（无 BiasNet）+ 轮速 NHC 位置累积；
+    outage 段不锚定 GNSS（模拟无融合 DR）。
     """
     T = len(seq['Time_s'])
     dt = TARGET_DT
-    tg = seq['Time_s']
     gyro_z = seq['gyro_z_rad']
-    v_ms   = seq['v_ms']
+    v_ms = seq['v_ms']
     gps_th = seq['gps_theta']
-    gps_v  = seq['gps_valid']
+    gps_v = gps_valid_nav if gps_valid_nav is not None else seq['gps_valid']
+    gx = seq['enu_x_truth']
+    gy = seq['enu_y_truth']
+
+    pos_ok = gps_v & np.isfinite(gx) & np.isfinite(gy)
+    first = int(np.where(pos_ok)[0][0]) if pos_ok.any() else 0
 
     heading = np.zeros(T, np.float32)
-    # 初始化：用第一个 GPS 有效帧的航向
-    first_valid = np.argmax(gps_v)
-    heading[first_valid] = float(gps_th[first_valid])
+    heading[first] = float(gps_th[first]) if np.isfinite(gps_th[first]) else 0.0
+    px, py = float(gx[first]), float(gy[first])
+    xs = np.full(T, np.nan, np.float32)
+    ys = np.full(T, np.nan, np.float32)
+    xs[first], ys[first] = px, py
 
-    for k in range(first_valid + 1, T):
-        dt_k = tg[k] - tg[k-1]
-        heading[k] = heading[k-1] + gyro_z[k] * (dt_k if dt_k > 0 else dt)
-        if gps_v[k]:
-            heading[k] = float(gps_th[k])      # GPS 有效时直接用 GPS 航向
+    for k in range(first + 1, T):
+        heading[k] = heading[k - 1] + float(gyro_z[k]) * dt
+        if pos_ok[k]:
+            heading[k] = float(gps_th[k])
+            px, py = float(gx[k]), float(gy[k])
+        else:
+            px += float(v_ms[k]) * np.cos(heading[k]) * dt
+            py += float(v_ms[k]) * np.sin(heading[k]) * dt
+        xs[k], ys[k] = px, py
 
-    dx = v_ms * np.cos(heading) * dt
-    dy = v_ms * np.sin(heading) * dt
-    return np.cumsum(dx), np.cumsum(dy), heading
+    xs[:first] = xs[first]
+    ys[:first] = ys[first]
+    return xs, ys, heading
 
 
 # ============================================================================
@@ -305,82 +311,96 @@ def rpe_30s(pred_x, pred_y, truth_x, truth_y, tg, window_s=30.0):
 # 绘图
 # ============================================================================
 
+def _align_origin(truth_x, truth_y, pred_x, pred_y, ref_idx):
+    ox = float(truth_x[ref_idx])
+    oy = float(truth_y[ref_idx])
+    return (truth_x - ox, truth_y - oy,
+            pred_x - float(pred_x[ref_idx]), pred_y - float(pred_y[ref_idx]))
+
+
 def plot_results(seq, dr_x, dr_y, dr_h,
-                 ekf_x, ekf_y, ekf_h, ekf_bias,
-                 loss_start_idx=None, loss_end_idx=None):
-    tg      = seq['Time_s']
+                 ekf_x, ekf_y, ekf_h, net_bias, ekf_bg,
+                 loss_start_idx=None, loss_end_idx=None,
+                 metrics_dr=None, metrics_ekf=None):
+    tg = seq['Time_s']
     truth_x = seq['enu_x_truth']
     truth_y = seq['enu_y_truth']
-    gps_v   = seq['gps_valid']
-    t_rel   = tg - tg[0]
+    t_rel = tg - tg[0]
 
-    # 仅在 GPS 有效处对齐零点（以首个有效帧为原点）
-    first = np.argmax(gps_v)
-    truth_ox = float(truth_x[first]) if not np.isnan(truth_x[first]) else 0.0
-    truth_oy = float(truth_y[first]) if not np.isnan(truth_y[first]) else 0.0
+    eval_mask = np.isfinite(truth_x) & np.isfinite(truth_y)
+    ref = int(np.where(eval_mask)[0][0])
+    tx, ty, drx, dry = _align_origin(truth_x, truth_y, dr_x, dr_y, ref)
+    _, _, ex, ey = _align_origin(truth_x, truth_y, ekf_x, ekf_y, ref)
 
-    # 位置预测同样从首帧对齐
-    dr_ox  = dr_x[first]; dr_oy  = dr_y[first]
-    ekf_ox = ekf_x[first]; ekf_oy = ekf_y[first]
+    idx_v = np.where(eval_mask)[0]
+    dr_err = np.sqrt((drx[idx_v] - tx[idx_v]) ** 2 + (dry[idx_v] - ty[idx_v]) ** 2)
+    ekf_err = np.sqrt((ex[idx_v] - tx[idx_v]) ** 2 + (ey[idx_v] - ty[idx_v]) ** 2)
 
-    tx = truth_x - truth_ox; ty = truth_y - truth_oy
-    dox = dr_x  - dr_ox;   doy = dr_y  - dr_oy
-    ex  = ekf_x - ekf_ox;  ey  = ekf_y - ekf_oy
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('GNSS/INS/Wheel 6-State EKF 验证', fontsize=14, fontweight='bold')
 
-    # 累积误差（GPS 有效处）
-    idx_v = np.where(gps_v)[0]
-    if len(idx_v) > 1:
-        dr_err  = np.sqrt((dox[idx_v] - tx[idx_v])**2 + (doy[idx_v] - ty[idx_v])**2)
-        ekf_err = np.sqrt((ex[idx_v]  - tx[idx_v])**2 + (ey[idx_v]  - ty[idx_v])**2)
-    else:
-        dr_err  = np.zeros(1); ekf_err = np.zeros(1)
-
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle('EKF 导航器验证结果（测试集）', fontsize=14, fontweight='bold')
-
-    # ---- (a) 轨迹对比 ----
+    # (a) 轨迹 — 等比例，限制显示范围防炸裂
     ax = axes[0, 0]
-    ax.plot(tx[idx_v], ty[idx_v], 'k-', lw=2, label='GPS 真值', zorder=5)
-    ax.plot(dox, doy, 'r--', lw=1.2, alpha=0.8, label='纯陀螺 DR')
-    ax.plot(ex,  ey,  'b-',  lw=1.5, alpha=0.9, label='BiasNet + EKF')
-    # 标记 GPS 丢失区间
+    ax.plot(tx[idx_v], ty[idx_v], 'g-', lw=2.0, label='GNSS 真值', zorder=5)
+    ax.plot(drx, dry, 'r--', lw=1.0, alpha=0.75, label='DR（纯陀螺+轮速）')
+    ax.plot(ex, ey, 'b-', lw=1.4, alpha=0.9, label='BiasNet + 6-State EKF')
     if loss_start_idx is not None and loss_end_idx is not None:
-        ax.axvspan(ex[loss_start_idx], ex[loss_end_idx],
-                   alpha=0.15, color='orange', label='GPS 丢失区间')
-        ax.plot(ex[loss_start_idx], ey[loss_start_idx],
-                'go', ms=8, label='丢失起点')
-        ax.plot(ex[loss_end_idx], ey[loss_end_idx],
-                'g^', ms=8, label='丢失终点')
-    ax.set_xlabel('East (m)'); ax.set_ylabel('North (m)')
-    ax.set_title('轨迹对比（橙色 = 模拟 GPS 丢失段）')
-    ax.legend(fontsize=8); ax.grid(True, alpha=0.4); ax.set_aspect('equal')
+        sl = slice(loss_start_idx, loss_end_idx)
+        ax.plot(ex[sl], ey[sl], color='darkorange', lw=2.2, label='GNSS outage 段')
+        ax.axvspan(ex[loss_start_idx], ex[min(loss_end_idx, len(ex) - 1)],
+                   alpha=0.12, color='orange')
+        ax.plot(ex[loss_start_idx], ey[loss_start_idx], 'go', ms=8)
+        ax.plot(ex[loss_end_idx - 1], ey[loss_end_idx - 1], 'r^', ms=8)
+    pad = 30.0
+    all_x = np.concatenate([tx[idx_v], drx[idx_v], ex[idx_v]])
+    all_y = np.concatenate([ty[idx_v], dry[idx_v], ey[idx_v]])
+    cx, cy = np.median(all_x), np.median(all_y)
+    half = max(np.percentile(np.abs(all_x - cx), 98),
+               np.percentile(np.abs(all_y - cy), 98), pad)
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+    ax.set_xlabel('East (m)')
+    ax.set_ylabel('North (m)')
+    ax.set_title('轨迹对比（原点对齐首帧 GNSS）')
+    ax.legend(fontsize=8, loc='best')
+    ax.grid(True, alpha=0.35)
+    ax.set_aspect('equal', adjustable='box')
 
-    # ---- (b) 累积位置误差 ----
+    # (b) 位置误差
     ax = axes[0, 1]
-    t_idx = t_rel[idx_v]
-    ax.plot(t_idx, dr_err,  'r-', lw=1.5, label=f'纯 DR  终点={dr_err[-1]:.1f} m')
-    ax.plot(t_idx, ekf_err, 'b-', lw=1.5, label=f'EKF    终点={ekf_err[-1]:.1f} m')
-    ax.set_xlabel('时间 (s)'); ax.set_ylabel('位置误差 (m)')
-    ax.set_title('累积位置误差 (GPS 有效帧)')
-    ax.legend(); ax.grid(True, alpha=0.4)
+    ax.plot(t_rel[idx_v], dr_err, 'r-', lw=1.2, label='DR')
+    ax.plot(t_rel[idx_v], ekf_err, 'b-', lw=1.2, label='EKF')
+    if loss_start_idx is not None:
+        ax.axvspan(t_rel[loss_start_idx], t_rel[min(loss_end_idx, len(t_rel) - 1)],
+                   alpha=0.12, color='orange', label='Outage')
+    ax.set_xlabel('时间 (s)')
+    ax.set_ylabel('位置误差 (m)')
+    ax.set_title('相对 GNSS 位置误差')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.35)
 
-    # ---- (c) 航向对比 ----
+    # (c) 航向
     ax = axes[1, 0]
-    gps_head = np.where(gps_v, seq['gps_theta'] * RAD2DEG, np.nan)
-    ax.plot(t_rel, gps_head, 'k-', lw=1.5, alpha=0.7, label='GPS 航向')
-    ax.plot(t_rel, dr_h * RAD2DEG,  'r--', lw=1, alpha=0.8, label='纯陀螺积分')
-    ax.plot(t_rel, ekf_h * RAD2DEG, 'b-',  lw=1.5, label='BiasNet+EKF')
-    ax.set_xlabel('时间 (s)'); ax.set_ylabel('航向 (°)')
+    gps_head = np.where(eval_mask, seq['gps_theta'] * RAD2DEG, np.nan)
+    ax.plot(t_rel, gps_head, 'g-', lw=1.2, alpha=0.8, label='GNSS 航向')
+    ax.plot(t_rel, dr_h * RAD2DEG, 'r--', lw=1.0, alpha=0.7, label='DR')
+    ax.plot(t_rel, ekf_h * RAD2DEG, 'b-', lw=1.2, label='EKF')
+    ax.set_xlabel('时间 (s)')
+    ax.set_ylabel('航向 (°)')
     ax.set_title('航向对比')
-    ax.legend(); ax.grid(True, alpha=0.4)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.35)
 
-    # ---- (d) 网络预测零偏 ----
+    # (d) 零偏：BiasNet vs EKF 残余
     ax = axes[1, 1]
-    ax.plot(t_rel, ekf_bias * RAD2DEG, 'g-', lw=1.2, label='BiasNet 预测零偏')
-    ax.axhline(0, color='k', linestyle='--', lw=0.8)
-    ax.set_xlabel('时间 (s)'); ax.set_ylabel('陀螺 Z 零偏 (°/s)')
-    ax.set_title('网络预测陀螺零偏')
-    ax.legend(); ax.grid(True, alpha=0.4)
+    ax.plot(t_rel, net_bias * RAD2DEG, 'g-', lw=1.0, label='BiasNet 预测')
+    ax.plot(t_rel, ekf_bg * RAD2DEG, 'b-', lw=1.0, alpha=0.8, label='EKF 残余 bg')
+    ax.axhline(0, color='k', ls='--', lw=0.6)
+    ax.set_xlabel('时间 (s)')
+    ax.set_ylabel('陀螺 Z 零偏 (°/s)')
+    ax.set_title('零偏估计')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.35)
 
     plt.tight_layout()
     out_path = OUTPUT_DIR / 'ekf_validation.png'
@@ -388,25 +408,93 @@ def plot_results(seq, dr_x, dr_y, dr_h,
     plt.close()
     print(f"\n[图像] 已保存到 {out_path}")
 
-    # ---- 打印汇总指标 ----
-    rpe_dr  = rpe_30s(dox, doy, tx, ty, t_rel)
-    rpe_ekf = rpe_30s(ex,  ey,  tx, ty, t_rel)
-    print("\n" + "=" * 55)
-    print("验证指标汇总")
-    print("=" * 55)
-    print(f"  GPS 有效帧数：{len(idx_v)} / {len(tg)} ({gps_v.mean():.1%})")
-    print(f"  测试时长：{t_rel[-1]:.0f} s")
-    if len(dr_err) > 0:
-        print(f"\n  纯 DR  ：终点误差 {dr_err[-1]:.2f} m  "
-              f"中值误差 {np.median(dr_err):.2f} m  "
-              f"RPE30s 中值 {np.median(rpe_dr):.2f} m")
-        print(f"  EKF    ：终点误差 {ekf_err[-1]:.2f} m  "
-              f"中值误差 {np.median(ekf_err):.2f} m  "
-              f"RPE30s 中值 {np.median(rpe_ekf):.2f} m")
-        if dr_err[-1] > 0:
-            improvement = (1 - ekf_err[-1] / dr_err[-1]) * 100
-            print(f"\n  终点误差改善：{improvement:+.1f}%")
-    print("=" * 55)
+    print("\n" + "=" * 60)
+    print("评估指标（相对 GNSS 真值）")
+    print("=" * 60)
+    for name, m in [('DR', metrics_dr), ('EKF', metrics_ekf)]:
+        if not m:
+            continue
+        print(f"\n  [{name}]")
+        print(f"    RMSE       : {m.get('rmse_m', float('nan')):.2f} m")
+        print(f"    中值误差   : {m.get('median_m', float('nan')):.2f} m")
+        print(f"    终点误差   : {m.get('final_m', float('nan')):.2f} m")
+        if 'outage_max_m' in m:
+            print(f"    Outage 最大: {m['outage_max_m']:.2f} m")
+            print(f"    Outage 中值: {m.get('outage_median_m', float('nan')):.2f} m")
+        if 'heading_rmse_deg' in m:
+            print(f"    航向 RMSE  : {m['heading_rmse_deg']:.2f} °")
+    print("=" * 60)
+
+
+def plot_ekf_diagnostics(seq, vel_x, vel_y, headings, net_bias, loss_start, loss_end):
+    """dt、车体速度、横向速度、BiasNet 限幅后零偏。"""
+    tg = seq['Time_s']
+    dt_arr = np.diff(tg, prepend=tg[0])
+    dt_arr[0] = TARGET_DT
+    t_rel = tg - tg[0]
+
+    v_fwd = np.zeros(len(tg), np.float32)
+    v_lat = np.zeros(len(tg), np.float32)
+    for k in range(len(tg)):
+        v_fwd[k], v_lat[k] = enu_to_body(float(vel_x[k]), float(vel_y[k]), float(headings[k]))
+
+    # 航向 unwrap 对比（检查跳变）
+    yaw_unwrap = np.unwrap(headings.astype(np.float64))
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('EKF 诊断：dt / 车体速度 / 横向速度 / 零偏', fontsize=13, fontweight='bold')
+
+    ax = axes[0, 0]
+    ax.plot(t_rel[1:], dt_arr[1:], 'b.', ms=2, alpha=0.6)
+    ax.axhline(TARGET_DT, color='r', ls='--', label=f'标称 dt={TARGET_DT}s')
+    ax.set_xlabel('时间 (s)')
+    ax.set_ylabel('dt (s)')
+    ax.set_title(f'dt 分布 (median={np.median(dt_arr[1:]):.4f}s)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.35)
+
+    ax = axes[0, 1]
+    ax.plot(t_rel, v_fwd, 'b-', lw=0.8, label='v_fwd (body)')
+    ax.plot(t_rel, seq['v_ms'], 'g--', lw=0.7, alpha=0.7, label='轮速')
+    if loss_start is not None:
+        ax.axvspan(t_rel[loss_start], t_rel[min(loss_end, len(t_rel) - 1)],
+                   alpha=0.12, color='orange')
+    ax.set_xlabel('时间 (s)')
+    ax.set_ylabel('m/s')
+    ax.set_title('前向速度 vs 轮速')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.35)
+
+    ax = axes[1, 0]
+    ax.plot(t_rel, v_lat, 'r-', lw=0.8)
+    ax.axhline(0, color='k', ls='--', lw=0.6)
+    if loss_start is not None:
+        ax.axvspan(t_rel[loss_start], t_rel[min(loss_end, len(t_rel) - 1)],
+                   alpha=0.12, color='orange', label='Outage')
+    ax.set_xlabel('时间 (s)')
+    ax.set_ylabel('v_lat (m/s)')
+    ax.set_title(f'横向速度 (|median|={np.median(np.abs(v_lat)):.3f} m/s)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.35)
+
+    ax = axes[1, 1]
+    ax.plot(t_rel, net_bias * RAD2DEG, 'g-', lw=0.9, label='BiasNet (tanh±1°/s)')
+    d_yaw = np.diff(yaw_unwrap, prepend=yaw_unwrap[0]) / np.maximum(dt_arr, 1e-3)
+    ax2 = ax.twinx()
+    ax2.plot(t_rel, d_yaw * RAD2DEG, 'b-', lw=0.5, alpha=0.5, label='yaw rate (unwrap)')
+    ax.set_xlabel('时间 (s)')
+    ax.set_ylabel('零偏 (°/s)', color='g')
+    ax2.set_ylabel('航向率 (°/s)', color='b')
+    ax.set_title('零偏 & 航向连续性')
+    ax.grid(True, alpha=0.35)
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / 'ekf_diagnostics.png'
+    plt.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"[诊断图] {out}")
+    print(f"  BiasNet |bias|: max={np.max(np.abs(net_bias))*RAD2DEG:.3f} deg/s")
+    print(f"  v_lat   : std={np.std(v_lat):.3f} m/s  max|.|={np.max(np.abs(v_lat)):.3f} m/s")
 
 
 # ============================================================================
@@ -426,70 +514,64 @@ def main():
     except Exception:
         seq = load_test_segment()
 
-    # 2. 模拟 GPS 丢失掩码
-    print("\n[1] 设置模拟 GPS 丢失...")
+    if 'gps_valid_full' not in seq:
+        seq['gps_valid_full'] = seq['gps_valid'].copy()
+
+    # 2. 模拟 GNSS outage
+    print("\n[1] 设置 GNSS outage 模拟...")
     gps_v_sim, loss_start, loss_end = simulate_gps_loss(seq)
     seq_sim = dict(seq)
-    seq_sim['gps_valid'] = gps_v_sim   # 用模拟后的掩码替换
+    seq_sim['gps_valid'] = gps_v_sim
 
-    # 3. 纯 DR 基准（模拟 GPS 丢失）
-    print("\n[2] 运行纯陀螺 DR（模拟 GPS 丢失）...")
-    dr_x, dr_y, dr_h = run_pure_dr(seq_sim)
+    outage_mask = np.zeros(len(seq['Time_s']), dtype=bool)
+    outage_mask[loss_start:loss_end] = True
 
-    # 4. BiasNet + EKF（模拟 GPS 丢失）
-    print("\n[3] 运行 BiasNet + EKF 导航器（模拟 GPS 丢失）...")
+    # 3. DR 基准
+    print("\n[2] 运行 DR 基准（outage 段无 GNSS 锚定）...")
+    dr_x, dr_y, dr_h = run_pure_dr(seq_sim, gps_valid_nav=gps_v_sim)
+
+    # 4. 6-State EKF
+    print("\n[3] 运行 BiasNet + 6-State EKF ...")
     if not WEIGHTS_PATH.exists():
-        raise RuntimeError(
-            f"未找到权重文件 {WEIGHTS_PATH}，请先运行 train_ekf.py")
+        raise RuntimeError(f"未找到权重 {WEIGHTS_PATH}，请先: python train_ekf.py")
 
     norm_stats = load_norm_stats(str(NORM_JSON))
     nav = EKFNavigatorNP(
         weights_path=str(WEIGHTS_PATH),
         norm_stats=norm_stats,
         window_size=WINDOW_SIZE,
+        ekf_config=DEFAULT_EKF_CONFIG,
     )
 
-    ekf_x, ekf_y, ekf_h, ekf_bias = nav.run(
-        imu_raw    = seq_sim['imu_raw'],
-        v_ms       = seq_sim['v_ms'],
-        gyro_z_rad = seq_sim['gyro_z_rad'],
-        gps_theta  = seq_sim['gps_theta'],
-        gps_valid  = gps_v_sim,
-        dt         = TARGET_DT,
+    gx = seq['enu_x_truth']
+    gy = seq['enu_y_truth']
+    ekf_x, ekf_y, ekf_h, net_bias, ekf_vx, ekf_vy, ekf_bg = nav.run(
+        imu_raw=seq_sim['imu_raw'],
+        v_ms=seq_sim['v_ms'],
+        gyro_z_rad=seq_sim['gyro_z_rad'],
+        gps_enu_x=gx,
+        gps_enu_y=gy,
+        gps_valid=gps_v_sim,
+        dt=TARGET_DT,
+        time_s=seq['Time_s'],
+        gps_theta=seq_sim['gps_theta'],
     )
 
-    # ---- 诊断：检查零偏预测是否合理 ----
-    print("\n[诊断] 零偏预测统计：")
-    print(f"  归一化统计量（标定数据）:")
-    for k in ['AccX_g','AccY_g','AccZ_g','GyroX_degs','GyroY_degs','GyroZ_degs']:
-        print(f"    {k:16s}  mean={norm_stats[k]['mean']:+8.4f}  std={norm_stats[k]['std']:.4f}")
-    print(f"  260316 IMU 原始范围:")
-    imu_cols = ['AccXRaw','AccYRaw','AccZRaw','GyroXRaw','GyroYRaw','GyroZRaw']
-    for i, c in enumerate(imu_cols):
-        print(f"    {c:16s}  mean={seq_sim['imu_raw'][:,i].mean():+8.4f}  std={seq_sim['imu_raw'][:,i].std():.4f}")
-    print(f"  BiasNet 预测零偏: mean={ekf_bias.mean()*RAD2DEG:.4f} deg/s  "
-          f"std={ekf_bias.std()*RAD2DEG:.4f} deg/s  "
-          f"min={ekf_bias.min()*RAD2DEG:.4f}  max={ekf_bias.max()*RAD2DEG:.4f}")
-    print(f"  陀螺 Z 原始角速度: mean={seq_sim['gyro_z_rad'].mean()*RAD2DEG:.4f} deg/s  "
-          f"std={seq_sim['gyro_z_rad'].std()*RAD2DEG:.4f} deg/s")
+    eval_mask = np.isfinite(gx) & np.isfinite(gy)
+    metrics_dr = evaluate_trajectory(
+        dr_x, dr_y, dr_h, gx, gy, seq['gps_theta'], eval_mask, outage_mask)
+    metrics_ekf = evaluate_trajectory(
+        ekf_x, ekf_y, ekf_h, gx, gy, seq['gps_theta'], eval_mask, outage_mask)
 
-    # ---- 诊断：GPS 丢失段航向误差 ----
-    gps_th_full = seq['gps_theta']  # 完整 GPS 航向真值
-    print(f"\n[诊断] GPS 丢失段航向对比（索引 {loss_start}–{loss_end}）：")
-    dr_head_err  = (dr_h[loss_start:loss_end] - gps_th_full[loss_start:loss_end]) * RAD2DEG
-    ekf_head_err = (ekf_h[loss_start:loss_end] - gps_th_full[loss_start:loss_end]) * RAD2DEG
-    print(f"  纯 DR  航向误差: 起点={dr_head_err[0]:.2f}°  终点={dr_head_err[-1]:.2f}°  "
-          f"max={np.abs(dr_head_err).max():.2f}°")
-    print(f"  EKF    航向误差: 起点={ekf_head_err[0]:.2f}°  终点={ekf_head_err[-1]:.2f}°  "
-          f"max={np.abs(ekf_head_err).max():.2f}°")
-
-    # 5. 绘图 + 指标（仅在 GPS 丢失段结束后的第一个 GPS 有效帧评估）
     print("\n[4] 绘制结果 ...")
-    # 将 gps_valid 替换为完整的（用于误差评估）
-    seq_plot = dict(seq_sim)
-    seq_plot['gps_valid'] = seq['gps_valid_full']
-    plot_results(seq_plot, dr_x, dr_y, dr_h, ekf_x, ekf_y, ekf_h, ekf_bias,
-                 loss_start_idx=loss_start, loss_end_idx=loss_end)
+    plot_results(
+        seq, dr_x, dr_y, dr_h, ekf_x, ekf_y, ekf_h, net_bias, ekf_bg,
+        loss_start_idx=loss_start, loss_end_idx=loss_end,
+        metrics_dr=metrics_dr, metrics_ekf=metrics_ekf,
+    )
+    print("\n[5] EKF 诊断 ...")
+    plot_ekf_diagnostics(
+        seq, ekf_vx, ekf_vy, ekf_h, net_bias, loss_start, loss_end)
 
 
 if __name__ == '__main__':
