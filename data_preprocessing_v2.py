@@ -22,7 +22,7 @@ warnings.filterwarnings('ignore')
 # 配置
 # ============================================================================
 
-DATA_DIR_CALIB    = Path(__file__).parent / "标定实车数据"
+DATA_DIR_CALIB    = Path(__file__).parent / "20260108_实车数据_txt"
 DATA_CSV_REAL     = Path(__file__).parent / "260316_Data" / "260316_Data.csv"
 OUTPUT_DIR        = Path(__file__).parent / "preprocessed_data"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -35,10 +35,14 @@ VEH_SPD_RAW_FACTOR = 260.63    # VehSpdRaw / factor = km/h
 GPS_MAX_SPEED_KMH  = 150.0     # GPS 跳点速度阈值
 MIN_SPEED_MS       = 0.5       # 低于此速度不计算 GPS 航向
 
-# 标定实车数据划分：Data01 → 训练+测试，Data02 → 验证（held-out）
-CALIB_TRAIN_ID      = "Data01"
-CALIB_VAL_ID        = "Data02"
-DATA01_TEST_RATIO   = 0.2      # Data01 末段 20% 时间作测试
+# 20260108 实车：Data01/02/03/04/06 训练+测试，Data05 验证（held-out）
+CALIB_TRAIN_IDS     = ["Data01", "Data02", "Data03", "Data04", "Data06"]
+CALIB_VAL_ID        = "Data05"
+CALIB_ALL_IDS       = CALIB_TRAIN_IDS + [CALIB_VAL_ID]
+# 兼容旧变量名
+CALIB_TRAIN_ID      = CALIB_TRAIN_IDS[0]
+TRAIN_TEST_RATIO    = 0.2       # 各训练集末段 20% 时间作测试
+DATA01_TEST_RATIO   = TRAIN_TEST_RATIO
 
 # 可选：260316 路跑（默认关闭，改用标定数据）
 USE_260316          = False
@@ -214,7 +218,26 @@ def dead_reckoning_nhc(t_arr, v_ms, heading_rad):
 # 加载标定实车数据（Data01 / Data02）
 # ============================================================================
 
-def split_df_by_time(df, test_ratio=DATA01_TEST_RATIO):
+def resolve_calibration_paths(data_dir, ds_id):
+    """
+    解析标定三文件路径。支持：
+      Data01_IMU.txt（旧）
+      Data01_跑道_IMU.txt（20260108 实车）
+    """
+    data_dir = Path(data_dir)
+    imu_candidates = sorted(data_dir.glob(f"{ds_id}_*_IMU.txt"))
+    if imu_candidates:
+        imu_f = imu_candidates[0]
+        prefix = imu_f.name[: -len("_IMU.txt")]
+    else:
+        imu_f = data_dir / f"{ds_id}_IMU.txt"
+        prefix = ds_id
+    spd_f = data_dir / f"{prefix}_VehicleSpeed.txt"
+    gps_f = data_dir / f"{prefix}_GNSS.txt"
+    return imu_f, spd_f, gps_f
+
+
+def split_df_by_time(df, test_ratio=TRAIN_TEST_RATIO):
     """按时间前 (1-ratio) 训练、后 ratio 测试，避免随机窗泄漏。"""
     t0, t1 = float(df['Time_s'].iloc[0]), float(df['Time_s'].iloc[-1])
     t_cut = t0 + (1.0 - test_ratio) * (t1 - t0)
@@ -225,12 +248,11 @@ def split_df_by_time(df, test_ratio=DATA01_TEST_RATIO):
 
 def load_calibration_dataset(data_dir, dataset_ids=None):
     if dataset_ids is None:
-        dataset_ids = [CALIB_TRAIN_ID, CALIB_VAL_ID]
+        dataset_ids = CALIB_ALL_IDS
     datasets = []
+    data_dir = Path(data_dir)
     for ds_id in dataset_ids:
-        imu_f   = data_dir / f"{ds_id}_IMU.txt"
-        spd_f   = data_dir / f"{ds_id}_VehicleSpeed.txt"
-        gps_f   = data_dir / f"{ds_id}_GNSS.txt"
+        imu_f, spd_f, gps_f = resolve_calibration_paths(data_dir, ds_id)
         if not imu_f.exists():
             print(f"  [SKIP] {ds_id} 不存在")
             continue
@@ -669,30 +691,45 @@ def main():
     import json
 
     print("=" * 70)
-    print("数据预处理 V2 —— 标定实车 Data01 训练/测试 + Data02 验证")
+    print("数据预处理 V2 —— 20260108 实车")
+    print(f"  训练+测试: {', '.join(CALIB_TRAIN_IDS)}")
+    print(f"  验证: {CALIB_VAL_ID}")
+    print(f"  数据目录: {DATA_DIR_CALIB}")
     print("=" * 70)
 
-    # ---- 1. Data01 ----
-    print(f"\n[1/4] 加载 {CALIB_TRAIN_ID}（训练+测试）...")
-    d01_list = load_calibration_dataset(DATA_DIR_CALIB, [CALIB_TRAIN_ID])
-    if not d01_list:
-        raise RuntimeError(f"{CALIB_TRAIN_ID} 加载失败，请检查 标定实车数据/ 下 IMU/GNSS/车速 文件")
-    df01 = clean_label_outliers(d01_list[0])
-    df01_train, df01_test, t_cut = split_df_by_time(df01)
-    print(f"  时间切分 t<{t_cut:.1f}s → 训练 {len(df01_train)} 行, "
-          f"t>={t_cut:.1f}s → 测试 {len(df01_test)} 行")
+    # ---- 1. 训练集（各段 80/20 时间切分）----
+    print(f"\n[1/4] 加载训练集 {CALIB_TRAIN_IDS} ...")
+    train_dfs_train, train_dfs_test, per_split = [], [], {}
+    for ds_id in CALIB_TRAIN_IDS:
+        dlist = load_calibration_dataset(DATA_DIR_CALIB, [ds_id])
+        if not dlist:
+            raise RuntimeError(
+                f"{ds_id} 加载失败，请检查 {DATA_DIR_CALIB} 下三传感器文件")
+        df = clean_label_outliers(dlist[0])
+        df_tr, df_te, t_cut = split_df_by_time(df)
+        train_dfs_train.append(df_tr)
+        train_dfs_test.append(df_te)
+        per_split[ds_id] = {
+            'train_time': [float(df_tr['Time_s'].iloc[0]),
+                           float(df_tr['Time_s'].iloc[-1])],
+            'test_time': [float(df_te['Time_s'].iloc[0]),
+                          float(df_te['Time_s'].iloc[-1])],
+            't_cut': float(t_cut),
+        }
+        print(f"  [{ds_id}] t<{t_cut:.1f}s 训练 {len(df_tr)} 行 | "
+              f"t>={t_cut:.1f}s 测试 {len(df_te)} 行")
 
-    # ---- 2. Data02 验证 ----
+    # ---- 2. 验证集 ----
     print(f"\n[2/4] 加载 {CALIB_VAL_ID}（验证，不参与训练）...")
-    d02_list = load_calibration_dataset(DATA_DIR_CALIB, [CALIB_VAL_ID])
-    if not d02_list:
+    val_list = load_calibration_dataset(DATA_DIR_CALIB, [CALIB_VAL_ID])
+    if not val_list:
         raise RuntimeError(f"{CALIB_VAL_ID} 加载失败")
-    df02 = clean_label_outliers(d02_list[0])
-    print(f"  验证段 {len(df02)} 行, GPS有效 {df02['GPS_valid'].mean():.1%}")
+    df_val = clean_label_outliers(val_list[0])
+    print(f"  验证段 {len(df_val)} 行, GPS有效 {df_val['GPS_valid'].mean():.1%}")
 
-    # ---- 3. 归一化（仅用 Data01 训练段统计）----
-    print("\n[3/4] 归一化统计量（仅 Data01 训练段）...")
-    norm_stats = compute_norm_stats([df01_train])
+    # ---- 3. 归一化（仅用各训练集训练段统计）----
+    print("\n[3/4] 归一化统计量（所有训练集训练段联合）...")
+    norm_stats = compute_norm_stats(train_dfs_train)
 
     def make_windows(dfs, tunnel_aug=False):
         Xp, Yp, tsp = [], [], []
@@ -710,16 +747,16 @@ def main():
                    np.empty((0, 2)), np.empty((0,))
         return np.concatenate(Xp), np.concatenate(Yp), np.concatenate(tsp)
 
-    print("  生成训练窗（Data01 训练段 + 隧道增强）...")
-    X_train, Y_train, ts_train = make_windows([df01_train], tunnel_aug=True)
+    print("  生成训练窗（各训练集训练段 + 隧道增强）...")
+    X_train, Y_train, ts_train = make_windows(train_dfs_train, tunnel_aug=True)
     print(f"    => {len(X_train)} 窗")
 
-    print("  生成测试窗（Data01 测试段）...")
-    X_test, Y_test, ts_test = make_windows([df01_test], tunnel_aug=False)
+    print("  生成测试窗（各训练集测试段）...")
+    X_test, Y_test, ts_test = make_windows(train_dfs_test, tunnel_aug=False)
     print(f"    => {len(X_test)} 窗")
 
-    print("  生成验证窗（Data02 整段）...")
-    X_val, Y_val, ts_val = make_windows([df02], tunnel_aug=False)
+    print(f"  生成验证窗（{CALIB_VAL_ID} 整段）...")
+    X_val, Y_val, ts_val = make_windows([df_val], tunnel_aug=False)
     print(f"    => {len(X_val)} 窗")
 
     if len(X_train) == 0:
@@ -738,16 +775,13 @@ def main():
     np.save(OUTPUT_DIR / "ts_val.npy", ts_val)
 
     split_info = {
-        'train_dataset': CALIB_TRAIN_ID,
-        'train_time': [float(df01_train['Time_s'].iloc[0]),
-                       float(df01_train['Time_s'].iloc[-1])],
-        'test_dataset': CALIB_TRAIN_ID,
-        'test_time': [float(df01_test['Time_s'].iloc[0]),
-                      float(df01_test['Time_s'].iloc[-1])],
+        'data_dir': str(DATA_DIR_CALIB.name),
+        'train_datasets': CALIB_TRAIN_IDS,
         'val_dataset': CALIB_VAL_ID,
-        'val_time': [float(df02['Time_s'].iloc[0]),
-                     float(df02['Time_s'].iloc[-1])],
-        'data01_test_ratio': DATA01_TEST_RATIO,
+        'val_time': [float(df_val['Time_s'].iloc[0]),
+                     float(df_val['Time_s'].iloc[-1])],
+        'train_test_ratio': TRAIN_TEST_RATIO,
+        'per_dataset_splits': per_split,
         'use_260316': USE_260316,
     }
     with open(OUTPUT_DIR / "dataset_split.json", 'w', encoding='utf-8') as f:
@@ -762,15 +796,15 @@ def main():
             'split': split_info,
         }, f, indent=2)
 
-    pd.concat([df01_train, df01_test], ignore_index=True).to_csv(
+    pd.concat(train_dfs_train + train_dfs_test, ignore_index=True).to_csv(
         OUTPUT_DIR / "aligned_data.csv", index=False)
-    df02.to_csv(OUTPUT_DIR / "val_aligned.csv", index=False)
+    df_val.to_csv(OUTPUT_DIR / "val_aligned.csv", index=False)
 
     print()
     print("=" * 70)
     print("预处理完成！")
-    print(f"  X_train ({CALIB_TRAIN_ID} 训练): {X_train.shape}")
-    print(f"  X_test  ({CALIB_TRAIN_ID} 测试): {X_test.shape}")
+    print(f"  X_train ({'+'.join(CALIB_TRAIN_IDS)} 训练段): {X_train.shape}")
+    print(f"  X_test  (同上各段末 {TRAIN_TEST_RATIO:.0%}): {X_test.shape}")
     print(f"  X_val   ({CALIB_VAL_ID} 验证):   {X_val.shape}")
     print(f"  dataset_split.json / val_aligned.csv 已保存")
     print("=" * 70)

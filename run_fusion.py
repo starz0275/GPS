@@ -25,7 +25,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from trajectory_data import (
-    load_calibration_segment, simulate_gps_loss, TARGET_DT)
+    load_calibration_segment, simulate_gps_loss, TARGET_DT,
+    VAL_DATASET_ID, CALIB_ALL_IDS,
+)
 from trajectory_fusion import FusedTrajectoryPredictor
 
 ROOT = Path(__file__).parent
@@ -37,8 +39,8 @@ NORM_JSON = ROOT / 'preprocessed_data' / 'normalization_stats.json'
 
 def main():
     ap = argparse.ArgumentParser(description='TCN+EKF 融合轨迹推理')
-    ap.add_argument('--dataset', default='Data02', choices=['Data01', 'Data02'],
-                    help='标定数据段（需有 标定实车数据/{id}_IMU/GNSS/VehicleSpeed.txt）')
+    ap.add_argument('--dataset', default=VAL_DATASET_ID, choices=CALIB_ALL_IDS,
+                    help='标定数据段（20260108_实车数据_txt 下 Data0x_* 三文件）')
     ap.add_argument('--loss-start', type=float, default=None,
                     help='模拟无 GPS 起始时间(s，相对段首)，不设则用真实 GPS 掩码')
     ap.add_argument('--loss-duration', type=float, default=60.0,
@@ -114,8 +116,13 @@ def main():
 
     fig, ax = plt.subplots(figsize=(12, 8))
     ok = np.isfinite(tx) & np.isfinite(ty)
-    ax.plot(tx[ok], ty[ok], 'g-', lw=1.5, label='GNSS')
-    ax.plot(fx, fy, 'b-', lw=1.2, label='Fused (TCN+EKF)')
+    ax.plot(tx[ok], ty[ok], color='#2ca02c', lw=3.5, alpha=0.45, label='GNSS', zorder=4)
+    ax.plot(fx, fy, color='#1565C0', lw=3, label='Fused (TCN+EKF)', zorder=8)
+    if on_out.any():
+        fx_o = fx.astype(float).copy()
+        fy_o = fy.astype(float).copy()
+        fx_o[~on_out] = fy_o[~on_out] = np.nan
+        ax.plot(fx_o, fy_o, color='#0D47A1', lw=4.5, label='Fused 失锁段', zorder=9)
     if on_out.any():
         ax.plot(fx[on_out], fy[on_out], 'r.', ms=3, alpha=0.6, label='No GPS segment')
     ax.set_aspect('equal')

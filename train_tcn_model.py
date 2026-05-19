@@ -115,7 +115,7 @@ def load_and_split_data():
     if val_path.exists():
         X_val = np.load(val_path)
         Y_val = np.load(OUTPUT_DIR / "Y_val.npy")
-        print(f"  训练: {len(X_tr)} 窗 (Data01)  验证: {len(X_val)} 窗 (Data02 held-out)")
+        print(f"  训练: {len(X_tr)} 窗  验证: {len(X_val)} 窗 (held-out)")
         return X_tr, Y_tr, X_val, Y_val, config
 
     print(f"  训练样本: {len(X_tr)}（无 X_val.npy，回退随机 {VAL_SPLIT:.0%} 划分）")
@@ -132,7 +132,7 @@ def load_and_split_data():
 
 def train_model():
     print("=" * 70)
-    print("1D-TCN 训练 V2（Data01 训练 / Data02 验证）")
+    print("1D-TCN 训练 V2（多段训练 / held-out 验证，见 dataset_split.json）")
     print("=" * 70)
 
     X_tr, Y_tr, X_val, Y_val, config = load_and_split_data()

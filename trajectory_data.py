@@ -15,10 +15,16 @@ VEH_SPD_FACTOR = 260.63
 MIN_SPEED_MS = 0.5
 
 DATA_CSV = Path(__file__).parent / "260316_Data" / "260316_Data.csv"
-DATA_DIR_CALIB = Path(__file__).parent / "标定实车数据"
 
-# 默认验证集：Data02（与 data_preprocessing_v2.CALIB_VAL_ID 一致）
-VAL_DATASET_ID = "Data02"
+from data_preprocessing_v2 import (
+    DATA_DIR_CALIB,
+    CALIB_VAL_ID,
+    CALIB_TRAIN_IDS,
+    CALIB_ALL_IDS,
+)
+
+# 默认验证集（与 data_preprocessing_v2.CALIB_VAL_ID 一致）
+VAL_DATASET_ID = CALIB_VAL_ID
 # 260316 保留段（USE_260316 时）
 VAL_T_START = 620.0
 
@@ -171,12 +177,11 @@ def load_segment(t_start=VAL_T_START, t_end=None):
 
 def load_calibration_segment(dataset_id=VAL_DATASET_ID):
     """
-    加载标定实车整段（Data01 / Data02），格式与 load_segment 相同。
-    验证融合轨迹时默认使用 Data02。
+    加载标定实车整段，格式与 load_segment 相同。
+    验证融合轨迹时默认使用 CALIB_VAL_ID（当前 Data05）。
     """
     from data_preprocessing_v2 import (
         load_calibration_dataset, clean_label_outliers, df_to_trajectory_seq,
-        DATA_DIR_CALIB,
     )
     dfs = load_calibration_dataset(DATA_DIR_CALIB, [dataset_id])
     if not dfs:

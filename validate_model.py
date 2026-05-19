@@ -1,7 +1,7 @@
 """
 模型验证脚本 —— TCN 残差评估
-  X_val / Y_val：Data02（验证集，训练时未见过）
-  X_test / Y_test：Data01 末段 20%（同数据集留出测试）
+  X_val / Y_val：Data05（验证集，训练时未见过）
+  X_test / Y_test：Data01–04/06 各段末 20% 测试窗
 绘制：
   1. 预测 vs 真实 残差散点
   2. 误差分布直方图
@@ -36,15 +36,15 @@ TARGET_FREQ = 10
 
 def main():
     print("=" * 65)
-    print("TCN Model Evaluation — Data02 val / Data01 test")
+    print("TCN Model Evaluation — held-out val / multi-segment test")
     print("=" * 65)
 
     model = tf.keras.models.load_model(MODEL_PATH, safe_mode=False, compile=False)
 
     if X_VAL.exists():
-        X_eval, Y_eval, tag = np.load(X_VAL), np.load(Y_VAL), "Data02 验证"
+        X_eval, Y_eval, tag = np.load(X_VAL), np.load(Y_VAL), "Data05 验证"
     else:
-        X_eval, Y_eval, tag = np.load(X_TEST), np.load(Y_TEST), "Data01 测试"
+        X_eval, Y_eval, tag = np.load(X_TEST), np.load(Y_TEST), "训练集测试窗"
     print(f"{tag}: {len(X_eval)} windows  shape={X_eval.shape}")
 
     Y_pred = model.predict(X_eval, batch_size=64, verbose=0)
@@ -72,16 +72,20 @@ def main():
     dr_x = np.cumsum(df['Base_dx'].values)
     dr_y = np.cumsum(df['Base_dy'].values)
 
-    # TCN 修正轨迹：Base_dx + 预测残差
-    # 找对齐到 df 时间戳的预测（按 ts 对应）
-    t_df = df['Time_s'].values
+    # TCN 修正轨迹：Base_dx + 预测残差（须与 ts_val 时刻精确对齐）
+    t_df = df['Time_s'].values.astype(np.float64)
     corr_dx = df['Base_dx'].values.copy()
     corr_dy = df['Base_dy'].values.copy()
+    n_misaligned = 0
     for j, t_j in enumerate(ts):
-        idx_in_df = np.searchsorted(t_df, t_j)
-        if 0 <= idx_in_df < len(df):
-            corr_dx[idx_in_df] += Y_pred[j, 0]
-            corr_dy[idx_in_df] += Y_pred[j, 1]
+        idx_in_df = int(np.argmin(np.abs(t_df - t_j)))
+        if abs(t_df[idx_in_df] - t_j) > 0.05:
+            n_misaligned += 1
+            continue
+        corr_dx[idx_in_df] += Y_pred[j, 0]
+        corr_dy[idx_in_df] += Y_pred[j, 1]
+    if n_misaligned > 0:
+        print(f"  [WARN] {n_misaligned}/{len(ts)} 个预测时刻未对齐到 CSV 网格")
     tcn_x = np.cumsum(corr_dx)
     tcn_y = np.cumsum(corr_dy)
 

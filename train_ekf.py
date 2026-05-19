@@ -35,7 +35,12 @@ from ekf_navigator import BiasNet
 # 配置
 # ============================================================================
 
-DATA_DIR_CALIB  = Path(__file__).parent / "标定实车数据"
+from data_preprocessing_v2 import (
+    DATA_DIR_CALIB,
+    CALIB_TRAIN_IDS,
+    CALIB_VAL_ID,
+    resolve_calibration_paths,
+)
 DATA_CSV_REAL   = Path(__file__).parent / "260316_Data" / "260316_Data.csv"
 NORM_JSON       = Path(__file__).parent / "preprocessed_data" / "normalization_stats.json"
 MODEL_DIR       = Path(__file__).parent / "trained_models"
@@ -96,16 +101,15 @@ def clean_gps_outliers(t, lat, lon, max_kmh=GPS_MAX_KMH):
 # 数据加载：标定实车数据
 # ============================================================================
 
-def load_calibration_seq(data_dir):
+def load_calibration_seq(data_dir, dataset_ids):
     """
-    加载 Data01/Data02，返回 list of dict (每段一个 dict)
+    加载标定实车各段，返回 list of dict (每段一个 dict)
     dict 键：Time_s, imu(T,6), gyro_z_rad(T,), v_ms(T,), gps_theta(T,), gps_valid(T,)
     """
     seqs = []
-    for ds_id in ['Data01', 'Data02']:
-        imu_f = data_dir / f'{ds_id}_IMU.txt'
-        spd_f = data_dir / f'{ds_id}_VehicleSpeed.txt'
-        gps_f = data_dir / f'{ds_id}_GNSS.txt'
+    data_dir = Path(data_dir)
+    for ds_id in dataset_ids:
+        imu_f, spd_f, gps_f = resolve_calibration_paths(data_dir, ds_id)
         if not imu_f.exists():
             continue
         try:
@@ -359,14 +363,14 @@ def main():
     print("BiasNet 训练：陀螺 Z 轴零偏预测")
     print("=" * 60)
 
-    # 1. 加载数据：Data01 训练，Data02 作 fit 验证
-    print("\n[1] 加载数据 (Data01 训练 / Data02 验证) ...")
-    seqs_tr = load_calibration_seq(DATA_DIR_CALIB)
-    seqs_tr = [s for s in seqs_tr if s.get('id', '').startswith('Data01')]
-    seqs_val = load_calibration_seq(DATA_DIR_CALIB)
-    seqs_val = [s for s in seqs_val if s.get('id', '').startswith('Data02')]
+    # 1. 加载数据：训练集训练 BiasNet，Data05 作 fit 验证
+    print(f"\n[1] 加载数据 ({', '.join(CALIB_TRAIN_IDS)} 训练 / "
+          f"{CALIB_VAL_ID} 验证) ...")
+    seqs_tr = load_calibration_seq(DATA_DIR_CALIB, CALIB_TRAIN_IDS)
+    seqs_val = load_calibration_seq(DATA_DIR_CALIB, [CALIB_VAL_ID])
     if not seqs_tr:
-        raise RuntimeError("未找到 Data01，请先运行 data_preprocessing_v2.py")
+        raise RuntimeError(
+            f"未找到训练集 {CALIB_TRAIN_IDS}，请先运行 data_preprocessing_v2.py")
 
     # 2. 归一化统计量
     print("\n[2] 准备归一化参数 ...")
@@ -375,10 +379,10 @@ def main():
     # 3. 构造训练样本
     print("\n[3] 构造训练样本 ...")
     X_tr, Y_tr = build_samples(seqs_tr, mu, std)
-    print(f"  Data01 训练样本: {len(X_tr)}")
+    print(f"  训练样本 ({len(CALIB_TRAIN_IDS)} 段): {len(X_tr)}")
     if seqs_val:
         X_val, Y_val = build_samples(seqs_val, mu, std)
-        print(f"  Data02 验证样本: {len(X_val)}")
+        print(f"  {CALIB_VAL_ID} 验证样本: {len(X_val)}")
     else:
         idx = np.random.permutation(len(X_tr))
         n_val = max(1, int(0.15 * len(X_tr)))
