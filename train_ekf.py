@@ -4,7 +4,7 @@ train_ekf.py — BiasNet 陀螺零偏预测网络训练脚本
 
 训练逻辑
 --------
-1. 从标定实车数据（Data01/Data02）和 260316 训练段加载数据
+1. 从标定实车数据训练段加载数据
 2. 计算每时刻的"真实"陀螺 Z 零偏：
      b_k = ω_z_measured(rad/s) − ω_heading_GPS(rad/s)
    其中 ω_heading_GPS = Δθ_GPS / dt（GPS 有效段推算）
@@ -41,7 +41,7 @@ from data_preprocessing_v2 import (
     CALIB_VAL_ID,
     resolve_calibration_paths,
 )
-DATA_CSV_REAL   = Path(__file__).parent / "260316_Data" / "260316_Data.csv"
+
 NORM_JSON       = Path(__file__).parent / "preprocessed_data" / "normalization_stats.json"
 MODEL_DIR       = Path(__file__).parent / "trained_models"
 MODEL_DIR.mkdir(exist_ok=True)
@@ -63,7 +63,7 @@ LR              = 3e-4
 PATIENCE        = 15
 WINDOW_S_INTEG  = 3.0         # 积分法零偏窗口（秒），替代原 BIAS_SMOOTH_W
 
-TRAIN_SPLIT_T   = 490.0       # 260316 前 70% 用于训练，后 30% 用于验证
+
 
 # ============================================================================
 # 坐标工具

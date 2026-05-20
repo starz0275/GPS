@@ -29,20 +29,20 @@ python validate_ekf.py
 
 - **`config.py`** — `EKFConfig` 数据类，包含所有可调过程/量测噪声参数、零偏限幅、速度门限和初始化协方差。
 
-- **`train_ekf.py`** — 训练流程：加载标定数据（Data01–Data06），用 GPS 航向变化率减去原始陀螺 Z 计算零偏标签，中值滤波平滑，构建滑窗，用 Huber 损失 + Adam 训练 BiasNet。
+- **`train_ekf.py`** — 训练流程：加载标定数据（Data01–Data04、Data06），用 GPS 航向变化率减去原始陀螺 Z 计算零偏标签，中值滤波平滑，构建滑窗，用 Huber 损失 + Adam 训练 BiasNet。
 
-- **`validate_ekf.py`** — 评估脚本：加载测试段（默认标定验证集 Data05），模拟 GNSS 丢失（90 秒），对比纯 DR 基准 vs BiasNet+EKF，绘制 2×2 对比图（轨迹叠加、误差曲线、航向、零偏时序）。
+- **`validate_ekf.py`** — 评估脚本：加载测试段（默认标定验证集 Data05），模拟 GNSS 丢失（90 秒），对比纯 DR 基准 vs BiasNet+EKF，绘制 2×2 对比图（轨迹叠加、误差曲线、航向、速度诊断）。
 
 - **`data_preprocessing_v2.py`** — 数据加载和预处理：GPS 异常点清洗（速度阈值 150 km/h）、WGS84→ENU 转换、传感器插值到 10 Hz 网格、滑窗生成。导出 `CALIB_TRAIN_IDS`、`CALIB_VAL_ID` 和跨文件使用的路径解析。
 
-- **`trajectory_data.py`** — 可视化/验证脚本的共享数据加载器：`load_segment()` 用于 260316 CSV 数据，`load_calibration_segment()` 用于标定数据。重新导出 `data_preprocessing_v2.py` 中的常量。
+-  暂时不用：**`trajectory_data.py`** — 可视化/验证脚本的共享数据加载器：`load_segment()` 用于 260316 CSV 数据，`load_calibration_segment()` 用于标定数据。重新导出 `data_preprocessing_v2.py` 中的常量。
 
 ### 关键数据流
 
 ```
 标定数据 (Data01-06) ──► train_ekf.py ──► BiasNet 权重 (.weights.h5)
                                                    │
-260316_Data.csv (测试段) ──► validate_ekf.py ──► EKFNavigatorNP
+Data05 (测试) ──► validate_ekf.py ──► EKFNavigatorNP
            │                                                │
            └──► imu_raw + v_ms + gyro_z + gps_enu ────────►│
                                                              │
