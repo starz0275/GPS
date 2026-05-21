@@ -54,7 +54,8 @@ from config import DEFAULT_EKF_CONFIG
 
 DATA_CSV       = Path(__file__).parent / "260316_Data" / "260316_Data.csv"
 MODEL_DIR      = Path(__file__).parent / "trained_models"
-WEIGHTS_PATH   = MODEL_DIR / "biasnet_weights.weights.h5"
+WEIGHTS_PATH       = MODEL_DIR / "biasnet_weights.weights.h5"
+COV_WEIGHTS_PATH   = MODEL_DIR / "cov_adapter_weights.weights.h5"
 NORM_JSON      = Path(__file__).parent / "preprocessed_data" / "normalization_stats.json"
 OUTPUT_DIR     = MODEL_DIR
 
@@ -263,14 +264,19 @@ def run_pure_dr(seq, gps_valid_nav=None):
     ys = np.full(T, np.nan, np.float32)
     xs[first], ys[first] = px, py
 
+    freeze_v = DEFAULT_EKF_CONFIG.freeze_yaw_below_ms
     for k in range(first + 1, T):
-        heading[k] = heading[k - 1] + float(gyro_z[k]) * dt
+        vw = float(v_ms[k]) if np.isfinite(v_ms[k]) else 0.0
         if pos_ok[k]:
             heading[k] = float(gps_th[k])
             px, py = float(gx[k]), float(gy[k])
         else:
-            px += float(v_ms[k]) * np.cos(heading[k]) * dt
-            py += float(v_ms[k]) * np.sin(heading[k]) * dt
+            if vw >= freeze_v:
+                heading[k] = heading[k - 1] + float(gyro_z[k]) * dt
+            else:
+                heading[k] = heading[k - 1]
+            px += vw * np.cos(heading[k]) * dt
+            py += vw * np.sin(heading[k]) * dt
         xs[k], ys[k] = px, py
 
     xs[:first] = xs[first]
@@ -561,6 +567,7 @@ def main():
         norm_stats=norm_stats,
         window_size=WINDOW_SIZE,
         ekf_config=DEFAULT_EKF_CONFIG,
+        cov_weights_path=str(COV_WEIGHTS_PATH) if COV_WEIGHTS_PATH.exists() else None,
     )
 
     gx = seq['enu_x_truth']

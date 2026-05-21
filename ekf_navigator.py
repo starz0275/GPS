@@ -114,6 +114,62 @@ class BiasNet(Model):
 
 
 # ============================================================================
+# CovAdapterNet —— AI 噪声参数适配器（论文 Section V-A）
+# ============================================================================
+
+class CovAdapterNet(Model):
+    """
+    输入：归一化后的 IMU 窗口 (batch, window, 6)
+    输出：(batch, 2) — [z_lat, z_up]，用于动态缩放 NHC 和轮速量测噪声。
+
+    架构与 BiasNet 相同，仅输出维度从 1 变为 2。
+    """
+
+    def __init__(self, window_size: int = 30):
+        super().__init__(name='CovAdapterNet')
+        self.conv1 = layers.Conv1D(32, 5, padding='causal', activation='relu')
+        self.conv2 = layers.Conv1D(32, 5, dilation_rate=4,
+                                   padding='causal', activation='relu')
+        self.conv3 = layers.Conv1D(16, 3, padding='causal', activation='relu')
+        self.pool = layers.GlobalAveragePooling1D()
+        self.fc1 = layers.Dense(32, activation='relu')
+        self.drop = layers.Dropout(0.2)
+        self.out = layers.Dense(2, activation='linear')   # → [z_lat, z_up]
+
+    def call(self, x, training=False):
+        h = self.conv1(x)
+        h = self.conv2(h)
+        h = self.conv3(h)
+        h = self.pool(h)
+        h = self.fc1(h)
+        h = self.drop(h, training=training)
+        return self.out(h)
+
+
+def map_noise_scale(z: np.ndarray, sigma_base: float, beta: float = 3.0) -> np.ndarray:
+    """
+    论文公式 (17)：z → 动态噪声标准差 σ_dyn。
+
+        σ_dyn = σ_base * 10^(β * tanh(z))
+
+    其中 β=3 时，缩放范围 ≈ 0.001x ~ 1000x。
+
+    参数
+    ----
+    z          : (N, 2) 或 (2,) — [z_lat, z_up] 原始网络输出
+    sigma_base : (2,) — [σ_lat, σ_up] 基础噪声标准差
+    beta       : 动态范围控制
+
+    返回
+    ----
+    sigma_dyn  : (N, 2) 或 (2,) — 方差
+    """
+    factor = 10.0 ** (beta * np.tanh(z))
+    sigma = sigma_base.reshape(1, -1) * factor if z.ndim == 2 else sigma_base * factor
+    return sigma ** 2  # 返回方差 R
+
+
+# ============================================================================
 # 6 状态 EKF
 # ============================================================================
 
@@ -163,15 +219,20 @@ class EKF6D:
         self._symmetrize_P()
 
     # ---- 时间更新（禁止用轮速覆盖 vx, vy）----
-    def predict(self, gyro_z_rad: float, bias_net: float, dt: float):
+    def predict(self, gyro_z_rad: float, bias_net: float, dt: float,
+                freeze_yaw: bool = False):
         """
         gyro_z_rad : 原始陀螺 Z (rad/s)
         bias_net   : BiasNet 预测零偏 (rad/s)，不写入状态
         dt         : 时间步长 (s)
+        freeze_yaw : True 时不积分航向（零速/停车，避免陀螺零偏积到 yaw）
         """
         px, py, vx, vy, yaw, bg = self.x
-        omega = float(gyro_z_rad) - float(bias_net) - bg
-        dpsi = omega * dt
+        if freeze_yaw:
+            dpsi = 0.0
+        else:
+            omega = float(gyro_z_rad) - float(bias_net) - bg
+            dpsi = omega * dt
         c, s = np.cos(dpsi), np.sin(dpsi)
 
         # 位置：用当前 ENU 速度积分
@@ -343,7 +404,8 @@ class EKFNavigatorNP:
                  weights_path: str,
                  norm_stats: dict,
                  window_size: int = 30,
-                 ekf_config: EKFConfig = None):
+                 ekf_config: EKFConfig = None,
+                 cov_weights_path: Optional[str] = None):
         self.window_size = window_size
         self.norm_stats = norm_stats
         self.ekf_config = ekf_config if ekf_config is not None else DEFAULT_EKF_CONFIG
@@ -356,6 +418,20 @@ class EKFNavigatorNP:
             wp += '.weights.h5'
         self.biasnet.load_weights(wp)
         print(f"[EKFNavigator] BiasNet 加载成功：{weights_path}")
+
+        # CovAdapterNet（可选）
+        self.cov_adapter = None
+        if cov_weights_path is not None:
+            self.cov_adapter = CovAdapterNet(window_size)
+            dummy_cov = np.zeros((1, window_size, 6), dtype=np.float32)
+            self.cov_adapter(dummy_cov)
+            cwp = str(cov_weights_path)
+            if not cwp.endswith('.weights.h5'):
+                cwp += '.weights.h5'
+            self.cov_adapter.load_weights(cwp)
+            print(f"[EKFNavigator] CovAdapterNet 加载成功：{cov_weights_path}")
+        else:
+            print("[EKFNavigator] CovAdapterNet 未加载（使用固定噪声）")
 
     def _normalize_imu(self, imu_raw: np.ndarray) -> np.ndarray:
         keys = ['AccX_g', 'AccY_g', 'AccZ_g',
@@ -381,6 +457,38 @@ class EKFNavigatorNP:
         bias_deg = clip_biasnet_output(raw, self.ekf_config.biasnet_max_deg)
         bias[W - 1:] = bias_deg * DEG2RAD
         return bias
+
+    def _predict_noise(self, imu_norm: np.ndarray) -> np.ndarray:
+        """
+        CovAdapterNet → [z_lat, z_up] → 动态量测噪声方差 (T, 2)。
+
+        若未加载 CovAdapterNet，返回基础噪声（从 config 读取）。
+        返回列: [R_lat, R_up] 单位为 (m/s)²。
+        """
+        cfg = self.ekf_config
+        T = len(imu_norm)
+        W = self.window_size
+        # 默认基础噪声
+        base = np.tile([cfg.r_nhc, cfg.r_wheel], (T, 1)).astype(np.float32)
+
+        if self.cov_adapter is None or T < W:
+            return base
+
+        windows = np.stack(
+            [imu_norm[i: i + W] for i in range(T - W + 1)], axis=0)
+        z_raw = self.cov_adapter(windows.astype(np.float32),
+                                 training=False).numpy()           # (N, 2)
+        z_full = np.zeros((T, 2), dtype=np.float32)
+        z_full[W - 1:] = z_raw
+
+        sigma_base = np.array([np.sqrt(cfg.r_nhc), np.sqrt(cfg.r_wheel)],
+                              dtype=np.float32)
+        for k in range(W - 1, T):
+            r_dyn = map_noise_scale(z_full[k], sigma_base, cfg.beta_noise_scale)
+            base[k, 0] = float(r_dyn[0])
+            base[k, 1] = float(r_dyn[1])
+
+        return base  # (T, 2) — [R_lat, R_up] 方差
 
     def _init_state(self, gps_x, gps_y, gps_v, v_ms, gps_theta, gyro_z, net_bias,
                      dt=0.1, time_s=None):
@@ -526,6 +634,7 @@ class EKFNavigatorNP:
 
         imu_norm = self._normalize_imu(imu_raw)
         net_bias = self._predict_bias(imu_norm)
+        noise_r = self._predict_noise(imu_norm)  # (T, 2) [R_lat, R_up]
 
         x0, k_start = self._init_state(
             gps_enu_x, gps_enu_y, gps_valid, v_ms, gps_theta, gyro_z_rad, net_bias,
@@ -551,18 +660,24 @@ class EKFNavigatorNP:
             bn = float(net_bias[k]) if np.isfinite(net_bias[k]) else 0.0
             vw = float(v_ms[k]) if np.isfinite(v_ms[k]) else 0.0
 
-            ekf.predict(gz, bn, dt_k)
+            still = vw < cfg.freeze_yaw_below_ms
+            ekf.predict(gz, bn, dt_k, freeze_yaw=still)
+            if still:
+                ekf.x[IDX_VX] = 0.0
+                ekf.x[IDX_VY] = 0.0
 
             if (gps_valid[k] and np.isfinite(gps_enu_x[k])
                     and np.isfinite(gps_enu_y[k])):
                 ekf.update_gnss_position(float(gps_enu_x[k]), float(gps_enu_y[k]))
 
             if enable_wheel_meas and vw >= cfg.min_speed_wheel_ms:
-                ekf.update_wheel_forward(vw)
+                r_wheel_dyn = float(noise_r[k, 1])  # 动态前向轮速噪声
+                ekf.update_wheel_forward(vw, r_wheel=r_wheel_dyn)
 
             if enable_nhc and vw >= cfg.min_speed_nhc_ms:
                 yaw_rate = gz - bn - ekf.bg
-                ekf.update_nhc(yaw_rate=yaw_rate)
+                r_nhc_dyn = float(noise_r[k, 0])  # 动态横向速度噪声
+                ekf.update_nhc(yaw_rate=yaw_rate, r_nhc=r_nhc_dyn)
 
             enu_x[k] = ekf.px
             enu_y[k] = ekf.py

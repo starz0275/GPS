@@ -27,6 +27,9 @@ class EKFConfig:
     # ---- BiasNet 推理限幅 ----
     biasnet_max_deg: float = 2.0     # |bias| <= 2 deg/s via tanh
 
+    # ---- CovAdapterNet（AI 噪声适配器）----
+    beta_noise_scale: float = 3.0    # 噪声动态范围 10^(±β) = 0.001x ~ 1000x
+
     # ---- GNSS 航向量测（备选，当前未启用）----
     r_gps_heading_rad2: float = (3.0 * 3.14159 / 180.0) ** 2
 
@@ -38,7 +41,8 @@ class EKFConfig:
     # ---- 量测门控 ----
     min_speed_wheel_ms: float = 0.5  # 低于此速度不做轮速更新 (~1.8 km/h)
     min_speed_nhc_ms: float = 0.5
-    min_speed_ms: float = 0.3        # 轮速 Jacobian 防除零
+    min_speed_ms: float = 0.3       # 轮速 Jacobian 防除零
+    freeze_yaw_below_ms: float = 0.5 # 低于此速度冻结航向（不积分陀螺），并 ZUPT 速度
 
     # ---- 数值 ----
     p_init_pos: float = 10.0 ** 2

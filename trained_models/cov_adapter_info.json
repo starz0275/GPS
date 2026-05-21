@@ -1,0 +1,8 @@
+{
+  "window_size": 30,
+  "beta_scale": 3.0,
+  "sigma_lat_ms": 0.08,
+  "sigma_up_ms": 0.12,
+  "train_samples": 11533,
+  "val_samples": 2228
+}
