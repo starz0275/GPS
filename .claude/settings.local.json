@@ -22,7 +22,16 @@
       "Bash(conda info *)",
       "Bash(cmd.exe *)",
       "Bash(grep -v \"WARNING\\\\|I0000\\\\|tensorflow\\\\|^$\")",
-      "Bash(grep -v \"WARNING\\\\|I0000\\\\|tensorflow\\\\|^$\\\\|config\")"
+      "Bash(grep -v \"WARNING\\\\|I0000\\\\|tensorflow\\\\|^$\\\\|config\")",
+      "Bash(conda env *)",
+      "Bash(findstr /I \"numpy pandas scipy tensorflow torch matplotlib scikit-learn\")",
+      "Bash(conda create *)",
+      "Bash(conda activate *)",
+      "Bash(C:\\\\Users\\\\zhoujiaqi\\\\miniconda3\\\\envs\\\\traj312\\\\python.exe *)",
+      "PowerShell(conda activate *)",
+      "PowerShell(conda run *)",
+      "PowerShell(pip config *)",
+      "PowerShell(wmic OS get TotalVirtualMemorySize,FreeVirtualMemory 2>&1)"
     ]
   }
 }

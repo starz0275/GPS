@@ -30,6 +30,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from ekf_navigator import BiasNet
+from config import DEFAULT_EKF_CONFIG
 
 # ============================================================================
 # 配置
@@ -461,6 +462,52 @@ def main():
           f"p95={np.percentile(np.abs(residual), 95):.5f} deg/s")
     print(f"\n权重已保存到：{WEIGHTS_PATH}")
     print("下一步：运行 validate_ekf.py 查看轨迹效果")
+
+    # 8. 保存训练日志
+    save_training_log(info, history, residual, DEFAULT_EKF_CONFIG)
+
+
+def save_training_log(info, history, residual, config_params):
+    """生成带时间戳的训练日志。"""
+    from datetime import datetime
+    log_dir = Path(__file__).parent / "training_logs"
+    log_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log = {
+        'timestamp': timestamp,
+        'config': {
+            'q_yaw': config_params.q_yaw,
+            'q_vel': config_params.q_vel,
+            'q_bg': config_params.q_bg,
+            'q_pos': config_params.q_pos,
+            'r_gps_xy': config_params.r_gps_xy,
+            'r_wheel': config_params.r_wheel,
+            'r_nhc': config_params.r_nhc,
+            'nhc_yaw_rate_thresh': config_params.nhc_yaw_rate_thresh,
+            'nhc_r_scale_turn': config_params.nhc_r_scale_turn,
+            'biasnet_max_deg': config_params.biasnet_max_deg,
+            'freeze_yaw_below_ms': config_params.freeze_yaw_below_ms,
+        },
+        'training': {
+            'train_samples': info['train_samples'],
+            'val_samples': info['val_samples'],
+            'epochs_completed': len(history.history['loss']),
+            'best_epoch': int(np.argmin(history.history['val_loss'])) + 1,
+            'best_val_loss': float(min(history.history['val_loss'])),
+            'best_val_mae_rads': info['best_val_mae_rads'],
+            'best_val_mae_degs': info['best_val_mae_degs'],
+        },
+        'prediction': {
+            'residual_mean_degs': float(residual.mean()),
+            'residual_std_degs': float(residual.std()),
+            'residual_p95_degs': float(np.percentile(np.abs(residual), 95)),
+        },
+    }
+    log_path = log_dir / f"train_{timestamp}.json"
+    with open(log_path, 'w', encoding='utf-8') as f:
+        json.dump(log, f, indent=2, ensure_ascii=False)
+    print(f"\n[日志] 已保存到 {log_path}")
+    return log_path
 
 
 if __name__ == '__main__':

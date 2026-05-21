@@ -601,6 +601,66 @@ def main():
     plot_ekf_diagnostics(
         seq, ekf_vx, ekf_vy, ekf_h, net_bias, loss_start, loss_end)
 
+    save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, tg)
+
+
+def save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, tg):
+    """生成带时间戳的验证日志。"""
+    import json
+    from datetime import datetime
+    from config import DEFAULT_EKF_CONFIG
+
+    log_dir = Path(__file__).parent / "training_logs"
+    log_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    outage_duration = float(tg[min(loss_end, len(tg)-1)] - tg[loss_start]) if loss_start is not None else 0.0
+
+    log = {
+        'timestamp': timestamp,
+        'config': {
+            'q_yaw': DEFAULT_EKF_CONFIG.q_yaw,
+            'q_vel': DEFAULT_EKF_CONFIG.q_vel,
+            'q_bg': DEFAULT_EKF_CONFIG.q_bg,
+            'q_pos': DEFAULT_EKF_CONFIG.q_pos,
+            'r_gps_xy': DEFAULT_EKF_CONFIG.r_gps_xy,
+            'r_wheel': DEFAULT_EKF_CONFIG.r_wheel,
+            'r_nhc': DEFAULT_EKF_CONFIG.r_nhc,
+            'nhc_yaw_rate_thresh': DEFAULT_EKF_CONFIG.nhc_yaw_rate_thresh,
+            'nhc_r_scale_turn': DEFAULT_EKF_CONFIG.nhc_r_scale_turn,
+            'biasnet_max_deg': DEFAULT_EKF_CONFIG.biasnet_max_deg,
+            'freeze_yaw_below_ms': DEFAULT_EKF_CONFIG.freeze_yaw_below_ms,
+        },
+        'simulation': {
+            'outage_duration_s': outage_duration,
+            'outage_start_idx': int(loss_start) if loss_start is not None else None,
+            'outage_end_idx': int(loss_end) if loss_end is not None else None,
+        },
+        'dr_metrics': {
+            'rmse_m': metrics_dr.get('rmse_m', None),
+            'median_m': metrics_dr.get('median_m', None),
+            'final_m': metrics_dr.get('final_m', None),
+            'max_m': metrics_dr.get('max_m', None),
+            'heading_rmse_deg': metrics_dr.get('heading_rmse_deg', None),
+        } if metrics_dr else None,
+        'ekf_metrics': {
+            'rmse_m': metrics_ekf.get('rmse_m', None),
+            'median_m': metrics_ekf.get('median_m', None),
+            'final_m': metrics_ekf.get('final_m', None),
+            'max_m': metrics_ekf.get('max_m', None),
+            'heading_rmse_deg': metrics_ekf.get('heading_rmse_deg', None),
+            'outage_max_m': metrics_ekf.get('outage_max_m', None),
+            'outage_median_m': metrics_ekf.get('outage_median_m', None),
+            'outage_final_m': metrics_ekf.get('outage_final_m', None),
+        } if metrics_ekf else None,
+    }
+
+    log_path = log_dir / f"validate_{timestamp}.json"
+    with open(log_path, 'w', encoding='utf-8') as f:
+        json.dump(log, f, indent=2, ensure_ascii=False)
+    print(f"\n[日志] 已保存到 {log_path}")
+    return log_path
+
 
 if __name__ == '__main__':
     main()
