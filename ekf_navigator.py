@@ -410,14 +410,23 @@ class EKFNavigatorNP:
         self.norm_stats = norm_stats
         self.ekf_config = ekf_config if ekf_config is not None else DEFAULT_EKF_CONFIG
 
+        # BiasNet 输入: 6 IMU 通道 + 1 轮速通道
         self.biasnet = BiasNet(window_size)
-        dummy = np.zeros((1, window_size, 6), dtype=np.float32)
+        dummy = np.zeros((1, window_size, 7), dtype=np.float32)
         self.biasnet(dummy)
         wp = str(weights_path)
         if not wp.endswith('.weights.h5'):
             wp += '.weights.h5'
-        self.biasnet.load_weights(wp)
-        print(f"[EKFNavigator] BiasNet 加载成功：{weights_path}")
+        try:
+            self.biasnet.load_weights(wp)
+            print(f"[EKFNavigator] BiasNet (7ch) 加载成功：{weights_path}")
+        except Exception:
+            # 兼容旧版6通道权重
+            self.biasnet = BiasNet(window_size)
+            dummy_6ch = np.zeros((1, window_size, 6), dtype=np.float32)
+            self.biasnet(dummy_6ch)
+            self.biasnet.load_weights(wp)
+            print(f"[EKFNavigator] BiasNet (6ch 兼容) 加载成功：{weights_path}")
 
         # CovAdapterNet（可选）
         self.cov_adapter = None
@@ -434,8 +443,10 @@ class EKFNavigatorNP:
             print("[EKFNavigator] CovAdapterNet 未加载（使用固定噪声）")
 
     def _normalize_imu(self, imu_raw: np.ndarray) -> np.ndarray:
+        """归一化 7 通道 [AccX/Y/Z, GyroX/Y/Z, VehicleSpeed_ms]。"""
         keys = ['AccX_g', 'AccY_g', 'AccZ_g',
-                'GyroX_degs', 'GyroY_degs', 'GyroZ_degs']
+                'GyroX_degs', 'GyroY_degs', 'GyroZ_degs',
+                'VehicleSpeed_ms']
         out = np.empty_like(imu_raw, dtype=np.float32)
         for i, k in enumerate(keys):
             mu = self.norm_stats[k]['mean']
@@ -634,9 +645,11 @@ class EKFNavigatorNP:
         if gps_theta is None:
             gps_theta = np.zeros(T, dtype=np.float32)
 
-        imu_norm = self._normalize_imu(imu_raw)
+        # 将轮速拼入 IMU 作为 BiasNet 第7通道（区分转弯 vs 零偏）
+        imu_7ch = np.column_stack([imu_raw, v_ms]) if imu_raw.shape[1] == 6 else imu_raw
+        imu_norm = self._normalize_imu(imu_7ch)
         net_bias = self._predict_bias(imu_norm)
-        noise_r = self._predict_noise(imu_norm)  # (T, 2) [R_lat, R_up]
+        noise_r = self._predict_noise(imu_norm[:, :6])  # CovAdapterNet 只用 IMU 6 通道
 
         x0, k_start = self._init_state(
             gps_enu_x, gps_enu_y, gps_valid, v_ms, gps_theta, gyro_z_rad, net_bias,

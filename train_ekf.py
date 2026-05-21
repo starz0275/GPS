@@ -133,6 +133,9 @@ def load_calibration_seq(data_dir, dataset_ids):
                                 for c in imu_cols], axis=1).astype(np.float32)
             v_kmh = interp1(spd['Time_s'].values, spd['VehicleSpeed_kmh'].values)
             v_ms  = v_kmh / 3.6
+            # 将轮速拼入 imu 矩阵（第7通道），让 BiasNet 能区分转弯 vs 零偏
+            imu_mat = np.concatenate([
+                imu_mat, v_ms.astype(np.float32).reshape(-1, 1)], axis=1)  # (T, 7)
 
             lat_raw = interp1(gps['Time_s'].values, gps['Latitude_deg'].values)
             lon_raw = interp1(gps['Time_s'].values, gps['Longitude_deg'].values)
@@ -265,7 +268,7 @@ def compute_bias_labels(seq, window_s=3.0):
     约束条件（三个掩码取 &）:
       1. gps_valid  — GPS 信号有效（来自原始配置）
       2. is_moving  — 轮速 > MIN_SPEED_MS（静止时 GPS 航向无规律跳变）
-      3. is_straight — |陀螺 Z| < 2 °/s（转向时 GPS/IMU 时间差导致角速率差飙升）
+      3. is_straight — |陀螺 Z| < 8 °/s（放宽阈值以包含转弯数据，避免 BiasNet 未见转弯）
 
     仅当窗口两端同时满足上述约束时，才用 3 秒积分窗计算零偏：
       bias = (Σ(gyro_z)*dt - Δθ_gps) / (N*dt)
@@ -284,7 +287,7 @@ def compute_bias_labels(seq, window_s=3.0):
 
     # ---- 三合一严格掩码 ----
     is_moving   = v_ms >= MIN_SPEED_MS                              # > 0.5 m/s
-    is_straight = np.abs(gyro_z) < 2.0 * DEG2RAD                    # |ω| < 2 °/s
+    is_straight = np.abs(gyro_z) < 8.0 * DEG2RAD                    # |ω| < 8 °/s（放宽→包含转弯）
     strict_ok   = gps_ok & is_moving & is_straight                   # 严格有效帧
 
     # ---- 滑动窗口积分计算零偏 ----
@@ -327,7 +330,7 @@ def load_or_compute_norm(seqs, norm_json_path):
     """
     优先从已有 normalization_stats.json 加载，否则从数据计算并保存。
     """
-    keys = ['AccX_g','AccY_g','AccZ_g','GyroX_degs','GyroY_degs','GyroZ_degs']
+    keys = ['AccX_g','AccY_g','AccZ_g','GyroX_degs','GyroY_degs','GyroZ_degs','VehicleSpeed_ms']
     if norm_json_path.exists():
         with open(norm_json_path) as f:
             raw = json.load(f)

@@ -336,7 +336,12 @@ def plot_results(seq, dr_x, dr_y, dr_h,
                  ekf_x, ekf_y, ekf_h, net_bias, ekf_bg,
                  ekf_vx, ekf_vy,
                  loss_start_idx=None, loss_end_idx=None,
-                 metrics_dr=None, metrics_ekf=None):
+                 metrics_dr=None, metrics_ekf=None,
+                 tag=''):
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag_str = f"_{tag}" if tag else ""
+    out_name = f"ekf_validation_{timestamp}{tag_str}.png"
     tg = seq['Time_s']
     truth_x = seq['enu_x_truth']
     truth_y = seq['enu_y_truth']
@@ -358,7 +363,7 @@ def plot_results(seq, dr_x, dr_y, dr_h,
         _, v_lat[k] = enu_to_body(float(ekf_vx[k]), float(ekf_vy[k]), float(ekf_h[k]))
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('GNSS/INS/Wheel 6-State EKF 验证', fontsize=14, fontweight='bold')
+    fig.suptitle(f'GNSS/INS/Wheel 6-State EKF 验证 ({timestamp})', fontsize=14, fontweight='bold')
 
     # (a) 轨迹 — 等比例，限制显示范围防炸裂
     ax = axes[0, 0]
@@ -440,7 +445,7 @@ def plot_results(seq, dr_x, dr_y, dr_h,
             bbox=dict(boxstyle='round,pad=0.4', facecolor='wheat', alpha=0.7))
 
     plt.tight_layout()
-    out_path = OUTPUT_DIR / 'ekf_validation.png'
+    out_path = OUTPUT_DIR / out_name
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"\n[图像] 已保存到 {out_path}")
@@ -467,7 +472,11 @@ def plot_results(seq, dr_x, dr_y, dr_h,
     print("=" * 60)
 
 
-def plot_ekf_diagnostics(seq, vel_x, vel_y, headings, net_bias, loss_start, loss_end):
+def plot_ekf_diagnostics(seq, vel_x, vel_y, headings, net_bias, loss_start, loss_end, tag=''):
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag_str = f"_{tag}" if tag else ""
+    out_name = f"ekf_diagnostics_{timestamp}{tag_str}.png"
     """
     速度诊断图（Figure 4）
       - 4A：Speed Magnitude Comparison — wheel speed vs EKF reconstructed speed
@@ -489,7 +498,7 @@ def plot_ekf_diagnostics(seq, vel_x, vel_y, headings, net_bias, loss_start, loss
     # Figure 4：速度诊断
     # ======================================================================
     fig, axes = plt.subplots(1, 2, figsize=(16, 5.5))
-    fig.suptitle('Figure 4：Velocity Diagnostic', fontsize=13, fontweight='bold')
+    fig.suptitle(f'Velocity Diagnostic ({timestamp})', fontsize=13, fontweight='bold')
 
     # ====== 4A: Speed Magnitude Comparison ======
     ax = axes[0]
@@ -523,7 +532,7 @@ def plot_ekf_diagnostics(seq, vel_x, vel_y, headings, net_bias, loss_start, loss
     ax.set_xlim(t_rel[0], t_rel[-1])
 
     plt.tight_layout()
-    out = OUTPUT_DIR / 'ekf_diagnostics.png'
+    out = OUTPUT_DIR / out_name
     plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"[诊断图] {out}")
@@ -558,9 +567,9 @@ def main():
     if 'gps_valid_full' not in seq:
         seq['gps_valid_full'] = seq['gps_valid'].copy()
 
-    # 2. 模拟 GNSS outage
-    print("\n[1] 设置 GNSS outage 模拟...")
-    gps_v_sim, loss_start, loss_end = simulate_gps_loss(seq)
+    # 2. 模拟 GNSS outage（对准 8 字路段 100s-200s）
+    print("\n[1] 设置 GNSS outage 模拟（覆盖八字路段）...")
+    gps_v_sim, loss_start, loss_end = simulate_gps_loss(seq, loss_duration_s=100.0, loss_start_s=100.0)
     seq_sim = dict(seq)
     seq_sim['gps_valid'] = gps_v_sim
 
@@ -582,7 +591,7 @@ def main():
         norm_stats=norm_stats,
         window_size=WINDOW_SIZE,
         ekf_config=DEFAULT_EKF_CONFIG,
-        cov_weights_path=None,  # CovAdapterNet 用旧 BiasNet 训练，与新模型不匹配；待重新训练
+        cov_weights_path=str(COV_WEIGHTS_PATH) if COV_WEIGHTS_PATH.exists() else None,
     )
 
     gx = seq['enu_x_truth']
@@ -615,10 +624,11 @@ def main():
         ekf_vx, ekf_vy,
         loss_start_idx=loss_start, loss_end_idx=loss_end,
         metrics_dr=metrics_dr, metrics_ekf=metrics_ekf,
+        tag='figure8',
     )
     print("\n[5] EKF 诊断 ...")
     plot_ekf_diagnostics(
-        seq, ekf_vx, ekf_vy, ekf_h, net_bias, loss_start, loss_end)
+        seq, ekf_vx, ekf_vy, ekf_h, net_bias, loss_start, loss_end, tag='figure8')
 
     save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, seq['Time_s'])
 

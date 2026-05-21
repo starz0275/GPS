@@ -40,18 +40,17 @@ RAD2DEG = 180.0 / np.pi
 TARGET_DT = 0.1
 WINDOW_SIZE = 30
 
-LR = 1e-4
-EPOCHS = 5             # 快速测试
+LR = 3e-4
+EPOCHS = 20
 GRAD_CLIP = 1.0
-CHUNK_SIZE = 80           # P 协方差梯度截断步长
-QUICK_TEST = True         # True 时只用 Data02
-QUICK_FRAMES = 500        # 快速测试时截取帧数
+CHUNK_SIZE = 80
 
 OUTPUT_DIR = Path(__file__).parent / 'trained_models'
 OUTPUT_DIR.mkdir(exist_ok=True)
 COV_WEIGHTS_PT = OUTPUT_DIR / 'cov_adapter_torch.pt'
 COV_WEIGHTS_H5 = OUTPUT_DIR / 'cov_adapter_weights.weights.h5'
 NORM_JSON = Path(__file__).parent / 'preprocessed_data' / 'normalization_stats.json'
+BIASNET_WEIGHTS = Path(__file__).parent / 'trained_models' / 'biasnet_weights.weights.h5'
 
 
 def load_norm_stats():
@@ -68,7 +67,31 @@ def normalize_imu(imu, mu, std):
     return (imu - mu) / std
 
 
-def seq_to_tensors(seq, mu, std, device, sim_outage=True):
+def compute_biasnet_predictions(seqs, mu, std):
+    """用训练好的 BiasNet 对全部序列做零偏预测。"""
+    from ekf_navigator import BiasNet, clip_biasnet_output
+    W = 30
+    model = BiasNet(window_size=W)
+    dummy = np.zeros((1, W, 6), dtype=np.float32)
+    model(dummy)
+    model.load_weights(str(BIASNET_WEIGHTS))
+    DEG2RAD_LOCAL = np.pi / 180.0
+
+    biases = []
+    for seq in seqs:
+        imu_norm = normalize_imu(seq['imu'], mu, std)
+        T = len(imu_norm)
+        bias = np.zeros(T, dtype=np.float32)
+        if T >= W:
+            windows = np.stack([imu_norm[i:i+W] for i in range(T - W + 1)], axis=0)
+            raw = model(windows.astype(np.float32), training=False).numpy().flatten()
+            raw_clipped = clip_biasnet_output(raw, 2.0)
+            bias[W - 1:] = raw_clipped * DEG2RAD_LOCAL
+        biases.append(bias.astype(np.float32))
+    return biases
+
+
+def seq_to_tensors(seq, mu, std, device, net_bias=None, sim_outage=True):
     """将一段轨迹转为 PyTorch tensor，可选模拟 GPS outage。"""
     T = len(seq['Time_s'])
     imu_norm = normalize_imu(seq['imu'], mu, std)
@@ -122,8 +145,11 @@ def seq_to_tensors(seq, mu, std, device, sim_outage=True):
     else:
         k_start = k0
 
-    # BiasNet 输出 → 用 0 代替
-    net_bias = np.zeros(T, dtype=np.float32)
+    # BiasNet 输出（如果提供则使用，否则用 0）
+    if net_bias is not None:
+        net_bias_arr = net_bias.astype(np.float32)
+    else:
+        net_bias_arr = np.zeros(T, dtype=np.float32)
 
     # ★ GPS outage 模拟 ★
     gps_valid_sim = gps_valid_truth.copy()
@@ -140,7 +166,7 @@ def seq_to_tensors(seq, mu, std, device, sim_outage=True):
     return {
         'imu_norm': torch.from_numpy(imu_norm).float().to(device),
         'gyro_z': torch.from_numpy(seq['gyro_z_rad'].astype(np.float32)).to(device),
-        'net_bias': torch.from_numpy(net_bias).to(device),
+        'net_bias': torch.from_numpy(net_bias_arr).to(device),
         'v_ms': torch.from_numpy(seq['v_ms'].astype(np.float32)).to(device),
         'gps_valid': gps_valid_sim,                        # ← EKF 用模拟的
         'gps_valid_truth': gps_valid_truth,                 # ← Loss 用原始的
@@ -200,14 +226,15 @@ def main():
     mu, std = load_norm_stats()
 
     # 2. 加载训练数据
-    if QUICK_TEST:
-        train_ids = ['Data02']
-        print(f"\n[1] 快速测试模式：加载 {train_ids[0]} ...")
-    else:
-        train_ids = list(CALIB_TRAIN_IDS)
-        print(f"\n[1] 加载训练序列 ({', '.join(train_ids)}) ...")
+    train_ids = list(CALIB_TRAIN_IDS)
+    print(f"\n[1] 加载训练序列 ({', '.join(train_ids)}) ...")
     seqs_tr = load_calibration_seq(DATA_DIR_CALIB, train_ids)
     print(f"  训练序列: {len(seqs_tr)} 段")
+
+    # ★ 用 BiasNet 为所有序列计算零偏预测
+    print("\n  [BiasNet] 计算零偏预测...")
+    net_biases = compute_biasnet_predictions(seqs_tr, mu, std)
+    print(f"  [BiasNet] 完成 ({len(net_biases)} 段)")
 
     print(f"\n[2] 构建模型 ...")
     cov_net = CovAdapterNetTorch(window_size=WINDOW_SIZE, in_channels=6).to(device)
@@ -233,7 +260,7 @@ def main():
     for epoch in range(EPOCHS):
         epoch_losses = []
         for seq_idx, seq in enumerate(seqs_tr):
-            data = seq_to_tensors(seq, mu, std, device)
+            data = seq_to_tensors(seq, mu, std, device, net_bias=net_biases[seq_idx])
             if data is None:
                 continue
 
@@ -241,10 +268,7 @@ def main():
             k0 = data['k_start']
             imu_norm = data['imu_norm']  # (T, 6)
 
-            # 快速测试：截取 k0 后的一段
             end_frame = T
-            if QUICK_TEST:
-                end_frame = min(k0 + QUICK_FRAMES, T)
 
             # ----- CovAdapterNet: 滑窗预测 z_lat, z_up -----
             if end_frame < WINDOW_SIZE + 1:
@@ -312,7 +336,33 @@ def main():
         best_cov.load_state_dict(torch.load(COV_WEIGHTS_PT, map_location=device))
     export_torch_to_keras(best_cov, COV_WEIGHTS_H5, WINDOW_SIZE)
 
-    print(f"\n完成！运行 python validate_ekf.py 查看效果")
+    # 5. 保存训练日志
+    from datetime import datetime
+    log = {
+        'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S"),
+        'config': {
+            'lr': LR, 'epochs': EPOCHS, 'grad_clip': GRAD_CLIP,
+            'chunk_size': CHUNK_SIZE,
+        },
+        'ekf_config': {k: float(v) for k, v in cfg_dict.items()},
+        'training': {
+            'datasets': train_ids,
+            'sequences': len(seqs_tr),
+            'best_loss': float(best_loss),
+            'final_epoch': epoch + 1,
+        },
+    }
+    log_dir = Path(__file__).parent / 'training_logs'
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / f"train_cov_{log['timestamp']}.json"
+    with open(log_path, 'w', encoding='utf-8') as f:
+        json.dump(log, f, indent=2, ensure_ascii=False)
+    print(f"\n[日志] 已保存到 {log_path}")
+    print(f"\n完成！运行 validate_ekf.py 查看效果")
+
+    # 重新启用 CovAdapterNet
+    print("\n提示：运行 validate_ekf.py 前确认已恢复 CovAdapterNet 加载")
+    print("  检查 validate_ekf.py 中 cov_weights_path 不为 None")
 
 
 if __name__ == '__main__':

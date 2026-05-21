@@ -41,6 +41,6 @@
   },
   "train_samples": 11533,
   "val_samples": 2228,
-  "best_val_mae_rads": 0.0018491145456209779,
-  "best_val_mae_degs": 0.10594645930033295
+  "best_val_mae_rads": 0.018094899132847786,
+  "best_val_mae_degs": 1.0367613510271112
 }

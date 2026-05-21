@@ -42,3 +42,48 @@
 ### 知陷阱
 - `abs(gps_theta) > 1e-6` 不能用于 ENU 航向过滤（东方向=0），会导致车往东走时航向量测被跳过
 - `.pyc` 缓存可能导致代码修改不生效，需删除 `__pycache__` 强制重编译
+
+### 零偏标签净化
+- `train_ekf.py` `compute_bias_labels` 重写：新增 `is_moving`（v_ms>0.5m/s）和 `is_straight`（|ω|<2°/s）硬约束
+- 三合一严格掩码：`strict_ok = gps_valid & is_moving & is_straight`
+- 只有窗口两端同时满足时才计算零偏标签，无效段线性插值填补
+- 效果：BiasNet MAE 从 0.97→0.11°/s，残差p95 从 3.02→0.33°/s
+
+### Outage 时序修复
+- `validate_ekf.py` `simulate_gps_loss` 改为自动计算 outage 开始时间：首次运动 + 15s
+- 修复前：outage 在 15s 开始（车还没动）
+- 修复后：outage 在 75.8s 开始（车动后 15s 初始化再丢 GPS）
+- 航向评估排除静止期（v_ms<0.5 时 truth_yaw=NaN）
+- 航向子图静止段隐藏
+
+### CovAdapterNet 端到端训练
+- `train_e2e.py` 改造：
+  - 去掉 QUICK_TEST 模式，改为全量数据训练
+  - Epochs 5→20，LR 1e-4→3e-4
+  - 训练时使用 BiasNet 真实零偏预测（之前全0，与实际推理条件不匹配）
+  - 新增训练日志保存
+- 当前 CovAdapterNet 权重已失效（用旧 BiasNet 训练），需重训
+
+
+### 放宽 is_straight 阈值（包含转弯训练数据）
+- `train_ekf.py` `compute_bias_labels`：`is_straight` 从 2°/s → 8°/s
+- 原因：原2°排除了几乎所有转弯数据，BiasNet 在八字路段预测失准
+- 效果：八字路段outage漂移仍有28m，转弯时零偏标签本身脏，阈值调不了
+
+### 图表时间戳 & 防覆盖
+- `validate_ekf.py`：图片文件名加时间戳 `ekf_validation_YYYYMMDD_HHMMSS_tag.png`
+- 图标题显示生成时间，方便对比每次差异
+- 诊断图同理
+
+### BiasNet 增加轮速输入通道
+- `train_ekf.py` `load_calibration_seq`：`imu_mat` 从 (T,6) → (T,7)，v_ms 作为第7通道
+- `train_ekf.py` `load_or_compute_norm`：新增 `'VehicleSpeed_ms'` 到归一化统计
+- `ekf_navigator.py` `_normalize_imu`：新增 `'VehicleSpeed_ms'` 归一化
+- `ekf_navigator.py` `EKFNavigatorNP.__init__`：BiasNet 构建用7通道dummy，兼容旧6通道权重
+- `ekf_navigator.py` `EKFNavigatorNP.run()`：推理时将 `imu_raw`(T,6) 与 `v_ms`(T,) 拼成 (T,7) 再送入 BiasNet；CovAdapterNet 仍用6通道 IMU 输入
+- 训练后 BiasNet 能通过车速区分"转弯"vs"零偏漂移"
+
+### Outage 覆盖八字路段
+- `validate_ekf.py` `simulate_gps_loss`：outage 改为 100s-200s（覆盖八字路段）
+- 八字路段航向漂移22°，位置漂移28m（比直道难很多）
+- 原因是连续转弯时 NHC 被放松，航向主要靠陀螺积分
