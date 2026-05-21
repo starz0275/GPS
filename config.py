@@ -31,7 +31,7 @@ class EKFConfig:
     beta_noise_scale: float = 3.0    # 噪声动态范围 10^(±β) = 0.001x ~ 1000x
 
     # ---- GNSS 航向量测（备选，当前未启用）----
-    r_gps_heading_rad2: float = (3.0 * 3.14159 / 180.0) ** 2
+    r_gps_heading_rad2: float = (0.5 * 3.14159 / 180.0) ** 2  # 0.5° std，强航向约束
 
     # ---- 初始零偏估计（用 GPS 位移推算）----
     bg_init_window_s: float = 10.0           # 估计窗口（秒）

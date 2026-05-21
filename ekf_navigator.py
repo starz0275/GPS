@@ -515,24 +515,24 @@ class EKFNavigatorNP:
         v0 = float(v_ms[k0_gps]) if np.isfinite(v_ms[k0_gps]) else 0.0
 
         # ---- 航向初始化 ----
-        # 若首帧静止，向后找第一段运动，用 GPS 位移推算航向
+        # 优先用 GPS 航向（即使静止，gps_theta 已有平滑值）
         yaw0 = 0.0
-        if v0 >= min_hdg_ms and np.isfinite(gps_theta[k0_gps]):
+        if np.isfinite(gps_theta[k0_gps]) and abs(gps_theta[k0_gps]) > 1e-6:
             yaw0 = float(gps_theta[k0_gps])
         else:
+            # 退而求其次：用运动段 GPS 位移推算
             moving = np.where((v_ms >= min_hdg_ms)
                               & np.isfinite(gps_x) & np.isfinite(gps_y))[0]
-            if len(moving) >= 5:
-                i_start = int(moving[0])
-                i_end = min(i_start + 10, len(gps_x) - 1)
-                dx = float(gps_x[i_end] - gps_x[i_start])
-                dy = float(gps_y[i_end] - gps_y[i_start])
-                if dx * dx + dy * dy > 4.0:  # ≥ 2m 位移
-                    yaw0 = float(np.arctan2(dy, dx))
-            if yaw0 == 0.0 and v0 > cfg.min_speed_ms:
-                k1 = min(k0_gps + 5, len(gps_x) - 1)
-                yaw0 = float(np.arctan2(
-                    float(gps_y[k1]) - py0, float(gps_x[k1]) - px0))
+            if len(moving) > 0:
+                i_m = int(moving[0])
+                if np.isfinite(gps_theta[i_m]) and abs(gps_theta[i_m]) > 1e-6:
+                    yaw0 = float(gps_theta[i_m])
+                else:
+                    i_end = min(i_m + 10, len(gps_x) - 1)
+                    dx = float(gps_x[i_end] - gps_x[i_m])
+                    dy = float(gps_y[i_end] - gps_y[i_m])
+                    if dx * dx + dy * dy > 1.0:  # ≥ 1m 位移（放宽条件）
+                        yaw0 = float(np.arctan2(dy, dx))
 
         # ---- 从静止或 GPS 位移推算初始零偏 ----
         bg0 = 0.0
@@ -613,6 +613,7 @@ class EKFNavigatorNP:
             gps_theta: Optional[np.ndarray] = None,
             enable_wheel_meas: bool = True,
             enable_nhc: bool = True,
+            enable_gnss_heading: bool = True,
             ) -> tuple:
         """
         参数
@@ -622,7 +623,8 @@ class EKFNavigatorNP:
         gyro_z_rad  : (T,) 陀螺 Z rad/s
         gps_enu_x/y : (T,) GNSS ENU 位置 (m)
         gps_valid   : (T,) bool，False 时不做 GNSS 更新（含 outage 模拟）
-        gps_theta   : (T,) 可选，仅用于初始化航向
+        gps_theta   : (T,) 可选，用于初始化航向 + 航向量测
+        enable_gnss_heading : True 时在 GPS 有效时用 gps_theta 直接校正航向
 
         返回
         ----
@@ -678,6 +680,12 @@ class EKFNavigatorNP:
                 yaw_rate = gz - bn - ekf.bg
                 r_nhc_dyn = float(noise_r[k, 0])  # 动态横向速度噪声
                 ekf.update_nhc(yaw_rate=yaw_rate, r_nhc=r_nhc_dyn)
+
+            # 航向量测放在最后（NHC/轮速之后），避免被其他量测覆盖
+            if (enable_gnss_heading and gps_valid[k]
+                    and np.isfinite(gps_theta[k])
+                    and vw >= cfg.min_speed_wheel_ms):
+                ekf.update_gnss_heading(float(gps_theta[k]))
 
             enu_x[k] = ekf.px
             enu_y[k] = ekf.py
@@ -748,5 +756,22 @@ def evaluate_trajectory(
         ])
         metrics['heading_rmse_deg'] = float(np.sqrt(np.mean(dyaw ** 2)) * RAD2DEG)
         metrics['heading_median_deg'] = float(np.median(np.abs(dyaw)) * RAD2DEG)
+
+        # 按 outage 拆分航向误差
+        if outage_mask is not None:
+            no_idx = yaw_idx[~outage_mask[yaw_idx]]
+            if len(no_idx) > 0:
+                dyaw_no = np.array([
+                    wrap_angle(float(pred_yaw[i]) - float(truth_yaw[i]))
+                    for i in no_idx
+                ])
+                metrics['heading_rmse_no_outage_deg'] = float(np.sqrt(np.mean(dyaw_no ** 2)) * RAD2DEG)
+            o_yaw = yaw_idx[outage_mask[yaw_idx]]
+            if len(o_yaw) > 0:
+                dyaw_o = np.array([
+                    wrap_angle(float(pred_yaw[i]) - float(truth_yaw[i]))
+                    for i in o_yaw
+                ])
+                metrics['heading_rmse_outage_deg'] = float(np.sqrt(np.mean(dyaw_o ** 2)) * RAD2DEG)
 
     return metrics

@@ -260,52 +260,63 @@ def load_real_seq(csv_path, t_max=None):
 
 def compute_bias_labels(seq, window_s=3.0):
     """
-    用积分法计算零偏（比微分法噪声低一个数量级）:
-      对 N 帧窗口积分航向:
-        Δθ_gps  = θ_gps[i] - θ_gps[i-N]           # GPS 航向变化
-        Δθ_gyro = Σ(gyro_z) * dt                    # 陀螺航向变化
-        bias    = (Δθ_gyro - Δθ_gps) / (N * dt)     # 平均零偏
+    用积分法计算零偏，配合速度 + 直行硬约束剔除噪声标签。
 
-    仅在窗口两端 GPS 有效时标签可信。返回 (T,) [rad/s] 及可信掩码。
+    约束条件（三个掩码取 &）:
+      1. gps_valid  — GPS 信号有效（来自原始配置）
+      2. is_moving  — 轮速 > MIN_SPEED_MS（静止时 GPS 航向无规律跳变）
+      3. is_straight — |陀螺 Z| < 2 °/s（转向时 GPS/IMU 时间差导致角速率差飙升）
+
+    仅当窗口两端同时满足上述约束时，才用 3 秒积分窗计算零偏：
+      bias = (Σ(gyro_z)*dt - Δθ_gps) / (N*dt)
+
+    无效段通过线性插值填补，保证输出序列完整。
+    返回 (T,) [rad/s] 及可信掩码 label_ok。
     """
     T = len(seq['Time_s'])
-    dt = float(np.median(np.diff(seq['Time_s'])))  # 典型 dt
-    N = max(1, int(window_s / dt))                 # 积分窗口帧数
-    dt_arr = np.full(T, dt)
+    dt = float(np.median(np.diff(seq['Time_s'])))
+    N = max(1, int(window_s / dt))
 
     gyro_z = seq['gyro_z_rad']                     # (T,) [rad/s]
     gps_th = seq['gps_theta']                      # (T,) [rad]
-    valid  = seq['gps_valid'].copy()               # 仅 GPS 有效段
+    gps_ok = seq['gps_valid']                      # (T,) bool — GPS 信号有效
+    v_ms   = seq['v_ms']                           # (T,) [m/s]
 
+    # ---- 三合一严格掩码 ----
+    is_moving   = v_ms >= MIN_SPEED_MS                              # > 0.5 m/s
+    is_straight = np.abs(gyro_z) < 2.0 * DEG2RAD                    # |ω| < 2 °/s
+    strict_ok   = gps_ok & is_moving & is_straight                   # 严格有效帧
+
+    # ---- 滑动窗口积分计算零偏 ----
     bias_labels = np.zeros(T, dtype=np.float32)
-
-    # 滑动窗口积分
-    gyro_cum = np.cumsum(gyro_z) * dt              # cum heading from gyro
+    gyro_cum = np.cumsum(gyro_z) * dt
     for i in range(N, T):
-        if valid[i] and valid[i - N]:              # 窗口两端 GPS 都有效
+        if strict_ok[i] and strict_ok[i - N]:        # 窗口两端均满足严格条件
             dth_gps = gps_th[i] - gps_th[i - N]
             dth_gps = np.arctan2(np.sin(dth_gps), np.cos(dth_gps))  # wrap
             dth_gyro = gyro_cum[i] - gyro_cum[i - N]
             bias_labels[i] = (dth_gyro - dth_gps) / (N * dt)
 
-    # 有效标签位置
+    # ---- 有效标签掩码（与 bias_labels 对齐：前 N 帧无标签）----
     label_ok = np.zeros(T, dtype=bool)
     if N < T:
-        label_ok[N:] = valid[N:] & valid[:-N]
+        label_ok[N:] = strict_ok[N:] & strict_ok[:-N]
 
-    # 无有效标签则返回 0
-    if label_ok.sum() < 2:
-        return bias_labels, label_ok
+    # ---- 后处理 ----
+    n_valid = label_ok.sum()
+    if n_valid < 2:
+        # 有效点太少无法做 median_filter + interp，直接返回 0
+        return bias_labels.astype(np.float32), label_ok
 
-    # 对有效段做一次轻中值平滑（去除残余毛刺）
-    bias_labels[label_ok] = median_filter(
-        bias_labels[label_ok], size=min(11, max(3, label_ok.sum() // 20)))
+    # 中值平滑（仅有效段，size 自适应防越界）
+    smooth_size = min(11, max(3, n_valid // 20))
+    bias_labels[label_ok] = median_filter(bias_labels[label_ok], size=smooth_size)
 
-    # 对无效段线性插值填充
+    # 线性插值填补无效段（保证输出连续）
     idx = np.arange(T)
-    bias_labels_filled = np.interp(idx, idx[label_ok], bias_labels[label_ok])
+    bias_labels[:] = np.interp(idx, idx[label_ok], bias_labels[label_ok])
 
-    return bias_labels_filled.astype(np.float32), label_ok
+    return bias_labels.astype(np.float32), label_ok
 
 
 # ============================================================================
@@ -507,6 +518,32 @@ def save_training_log(info, history, residual, config_params):
     with open(log_path, 'w', encoding='utf-8') as f:
         json.dump(log, f, indent=2, ensure_ascii=False)
     print(f"\n[日志] 已保存到 {log_path}")
+
+    # ---- 追加汇总到 SUMMARY_TRAIN.md ----
+    summary_path = log_dir / "SUMMARY_TRAIN.md"
+    if not summary_path.exists():
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write("# 训练记录汇总\n\n")
+            f.write("| 时间 | 样本数 | Epochs | Best val MAE(°/s) |"
+                    " 残差mean(°/s) | 残差std(°/s) | 残差p95(°/s) |\n")
+            f.write("|------|--------|--------|--------------------|"
+                    "------------------|-----------------|----------------|\n")
+
+    tr = log['training']
+    pr = log['prediction']
+    dt_str = datetime.now().strftime("%m-%d %H:%M")
+    line = (
+        f"| {dt_str} "
+        f"| {tr['train_samples']} "
+        f"| {tr['epochs_completed']}/{tr.get('best_epoch', '—')} "
+        f"| {tr['best_val_mae_degs']:.4f} "
+        f"| {pr['residual_mean_degs']:+.4f} "
+        f"| {pr['residual_std_degs']:.4f} "
+        f"| {pr['residual_p95_degs']:.4f} |\n"
+    )
+    with open(summary_path, 'a', encoding='utf-8') as f:
+        f.write(line)
+    print(f"[汇总] 已追加到 {summary_path}")
     return log_path
 
 

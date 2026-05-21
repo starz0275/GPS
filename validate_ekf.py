@@ -216,21 +216,29 @@ def load_test_segment():
 
 
 GPS_LOSS_SIM_SECS = 90.0    # 模拟 GNSS outage 时长（秒）
-GPS_LOSS_START_S  = 15.0    # 相对段起点，留时间初始化 EKF
 
 
-def simulate_gps_loss(seq, loss_duration_s=GPS_LOSS_SIM_SECS):
+def simulate_gps_loss(seq, loss_duration_s=GPS_LOSS_SIM_SECS, loss_start_s=None):
     """隧道场景：屏蔽 GNSS 位置量测（仅保留 wheel + NHC + INS）。"""
     tg = seq['Time_s']
     gps_full = seq.get('gps_valid_full', seq['gps_valid'])
-    # 位置更新需要有效坐标，用完整 GNSS 掩码（非仅航向有效）
     pos_ok = (
         gps_full
         & np.isfinite(seq['enu_x_truth'])
         & np.isfinite(seq['enu_y_truth'])
     )
+    # 自动计算 outage 开始时间：首次运动 + 5s（给 EKF 初始化时间）
+    if loss_start_s is None:
+        motion_idx = np.where(seq['v_ms'] >= 0.5)[0]
+        if len(motion_idx) > 0:
+            loss_start_s = float(tg[motion_idx[0]] - tg[0]) + 15.0
+            print(f"  [自动] 首次运动在 {float(tg[motion_idx[0]] - tg[0]):.1f}s，"
+                  f"outage 从 {loss_start_s:.1f}s 开始")
+        else:
+            loss_start_s = 15.0
+
     gps_v, i0, i1 = simulate_gnss_outage(
-        pos_ok, tg, GPS_LOSS_START_S, GPS_LOSS_START_S + loss_duration_s)
+        pos_ok, tg, loss_start_s, loss_start_s + loss_duration_s)
     print(f"  [模拟 GNSS outage] 索引 {i0}–{i1}，"
           f"持续 {tg[min(i1, len(tg)-1)] - tg[i0]:.1f} s")
     return gps_v, i0, i1
@@ -392,12 +400,15 @@ def plot_results(seq, dr_x, dr_y, dr_h,
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.35)
 
-    # (c) 航向
+    # (c) 航向（静止段隐藏，仅显示运动时的航向）
     ax = axes[1, 0]
-    gps_head = np.where(eval_mask, seq['gps_theta'] * RAD2DEG, np.nan)
+    moving = seq['v_ms'] >= 0.5
+    gps_head = np.where(eval_mask & moving, seq['gps_theta'] * RAD2DEG, np.nan)
+    dr_h_plot = np.where(moving, dr_h * RAD2DEG, np.nan)
+    ekf_h_plot = np.where(moving, ekf_h * RAD2DEG, np.nan)
     ax.plot(t_rel, gps_head, 'g-', lw=1.2, alpha=0.8, label='GNSS 航向')
-    ax.plot(t_rel, dr_h * RAD2DEG, 'r--', lw=1.0, alpha=0.7, label='DR')
-    ax.plot(t_rel, ekf_h * RAD2DEG, 'b-', lw=1.2, label='EKF')
+    ax.plot(t_rel, dr_h_plot, 'r--', lw=1.0, alpha=0.7, label='DR')
+    ax.plot(t_rel, ekf_h_plot, 'b-', lw=1.2, label='EKF')
     ax.set_xlabel('时间 (s)')
     ax.set_ylabel('航向 (°)')
     ax.set_title('航向对比')
@@ -449,6 +460,10 @@ def plot_results(seq, dr_x, dr_y, dr_h,
             print(f"    Outage 中值: {m.get('outage_median_m', float('nan')):.2f} m")
         if 'heading_rmse_deg' in m:
             print(f"    航向 RMSE  : {m['heading_rmse_deg']:.2f} °")
+            if 'heading_rmse_no_outage_deg' in m:
+                print(f"    航向 RMSE(GPS有效): {m['heading_rmse_no_outage_deg']:.2f} °")
+            if 'heading_rmse_outage_deg' in m:
+                print(f"    航向 RMSE(outage):  {m['heading_rmse_outage_deg']:.2f} °")
     print("=" * 60)
 
 
@@ -567,7 +582,7 @@ def main():
         norm_stats=norm_stats,
         window_size=WINDOW_SIZE,
         ekf_config=DEFAULT_EKF_CONFIG,
-        cov_weights_path=str(COV_WEIGHTS_PATH) if COV_WEIGHTS_PATH.exists() else None,
+        cov_weights_path=None,  # CovAdapterNet 用旧 BiasNet 训练，与新模型不匹配；待重新训练
     )
 
     gx = seq['enu_x_truth']
@@ -585,10 +600,14 @@ def main():
     )
 
     eval_mask = np.isfinite(gx) & np.isfinite(gy)
+    # 航向真值：静止时 GPS 航向不可靠（位置位移噪声），仅当运动时参与评估
+    truth_yaw = seq['gps_theta'].copy()
+    still = seq['v_ms'] < 0.5
+    truth_yaw[still] = np.nan
     metrics_dr = evaluate_trajectory(
-        dr_x, dr_y, dr_h, gx, gy, seq['gps_theta'], eval_mask, outage_mask)
+        dr_x, dr_y, dr_h, gx, gy, truth_yaw, eval_mask, outage_mask)
     metrics_ekf = evaluate_trajectory(
-        ekf_x, ekf_y, ekf_h, gx, gy, seq['gps_theta'], eval_mask, outage_mask)
+        ekf_x, ekf_y, ekf_h, gx, gy, truth_yaw, eval_mask, outage_mask)
 
     print("\n[4] 绘制结果 ...")
     plot_results(
@@ -601,11 +620,11 @@ def main():
     plot_ekf_diagnostics(
         seq, ekf_vx, ekf_vy, ekf_h, net_bias, loss_start, loss_end)
 
-    save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, tg)
+    save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, seq['Time_s'])
 
 
 def save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, tg):
-    """生成带时间戳的验证日志。"""
+    """生成带时间戳的验证日志，并追加汇总到 SUMMARY.md。"""
     import json
     from datetime import datetime
     from config import DEFAULT_EKF_CONFIG
@@ -649,6 +668,8 @@ def save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, tg):
             'final_m': metrics_ekf.get('final_m', None),
             'max_m': metrics_ekf.get('max_m', None),
             'heading_rmse_deg': metrics_ekf.get('heading_rmse_deg', None),
+            'heading_rmse_no_outage_deg': metrics_ekf.get('heading_rmse_no_outage_deg', None),
+            'heading_rmse_outage_deg': metrics_ekf.get('heading_rmse_outage_deg', None),
             'outage_max_m': metrics_ekf.get('outage_max_m', None),
             'outage_median_m': metrics_ekf.get('outage_median_m', None),
             'outage_final_m': metrics_ekf.get('outage_final_m', None),
@@ -659,6 +680,35 @@ def save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, tg):
     with open(log_path, 'w', encoding='utf-8') as f:
         json.dump(log, f, indent=2, ensure_ascii=False)
     print(f"\n[日志] 已保存到 {log_path}")
+
+    # ---- 追加汇总到 SUMMARY_VAL.md ----
+    summary_path = log_dir / "SUMMARY_VAL.md"
+    if not summary_path.exists():
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            f.write("# 验证记录汇总\n\n")
+            f.write("| 时间 | RMSE(m) | Outage最大(m) | Outage中值(m) |"
+                    " 航向RMSE(°) | 航向(GPS有效)(°) | 航向(outage)(°) |"
+                    " q_vel | r_nhc | r_gps_hdg |\n")
+            f.write("|------|---------|---------------|---------------|"
+                    "--------------|--------------------|-------------------|"
+                    "-------|-------|------------|\n")
+
+    m = log['ekf_metrics'] or {}
+    dt_str = datetime.now().strftime("%m-%d %H:%M")
+    c = log['config']
+    line = (
+        f"| {dt_str} "
+        f"| {m.get('rmse_m', '—'):<7.2f} "
+        f"| {m.get('outage_max_m', '—'):<13.2f} "
+        f"| {m.get('outage_median_m', '—'):<13.2f} "
+        f"| {m.get('heading_rmse_deg', '—'):<12.2f} "
+        f"| {m.get('heading_rmse_no_outage_deg', '—'):<18.2f} "
+        f"| {m.get('heading_rmse_outage_deg', '—'):<17.2f} "
+        f"| {c['q_vel']:.2e} | {c['r_nhc']:.2e} | {c['r_gps_xy']:.2e} |\n"
+    )
+    with open(summary_path, 'a', encoding='utf-8') as f:
+        f.write(line)
+    print(f"[汇总] 已追加到 {summary_path}")
     return log_path
 
 
