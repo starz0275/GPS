@@ -361,22 +361,51 @@ def normalize_imu(imu, mu, std):
 # 构造训练样本
 # ============================================================================
 
-def build_samples(seqs, mu, std, window_size=WINDOW_SIZE):
+def build_samples(seqs, mu, std, window_size=WINDOW_SIZE, tunnel_aug=True):
     """
     返回 X (N, W, 6) 和 Y (N, 1) [rad/s]
+
+    当 tunnel_aug=True 时，对每段数据模拟一段 GPS 丢失，生成额外的训练窗口，
+    让 BiasNet 学会在 GPS 丢失场景下的零偏预测。
     """
     X_list, Y_list = [], []
-    for seq in seqs:
-        imu_norm = normalize_imu(seq['imu'], mu, std)     # (T, 6)
-        bias, _ = compute_bias_labels(seq)                  # (T,) [rad/s]
 
+    def _windows_from_seq(seq, label=''):
+        imu_norm = normalize_imu(seq['imu'], mu, std)      # (T, 7)
+        bias, _ = compute_bias_labels(seq)                   # (T,) [rad/s]
         T = len(imu_norm)
         if T < window_size:
-            continue
-
+            return
         for i in range(T - window_size + 1):
-            X_list.append(imu_norm[i: i + window_size])    # (W, 6)
-            Y_list.append(bias[i + window_size - 1])       # 预测窗口末帧的零偏
+            X_list.append(imu_norm[i: i + window_size])
+            Y_list.append(bias[i + window_size - 1])
+
+    for seq in seqs:
+        _windows_from_seq(seq)
+
+        # ---- 隧道增强：模拟一段 GPS 丢失 ----
+        if tunnel_aug:
+            import copy
+            seq_aug = copy.deepcopy(seq)
+            T = len(seq_aug['Time_s'])
+            # 在中间段找一段运动平稳的区域模拟掉 GPS
+            motion = np.where(seq_aug['v_ms'] >= MIN_SPEED_MS)[0]
+            if len(motion) < 100:
+                continue
+            mid = len(motion) // 2
+            center = motion[mid]
+            half = 40  # 模拟 4 秒掉 GPS（前后留缓冲）
+            out_start = max(0, center - half)
+            out_end = min(T, center + half)
+            if out_end - out_start < 30:
+                continue
+            # 把这一段标记为 GPS 无效 → compute_bias_labels 会插值填补偏标签
+            seq_aug['gps_valid'][out_start:out_end] = False
+            _windows_from_seq(seq_aug, label='tunnel')
+
+    if not X_list:
+        return np.empty((0, window_size, 7), dtype=np.float32), \
+               np.empty((0, 1), dtype=np.float32)
 
     X = np.stack(X_list, axis=0).astype(np.float32)
     Y = np.array(Y_list, np.float32).reshape(-1, 1)
@@ -407,10 +436,10 @@ def main():
 
     # 3. 构造训练样本
     print("\n[3] 构造训练样本 ...")
-    X_tr, Y_tr = build_samples(seqs_tr, mu, std)
-    print(f"  训练样本 ({len(CALIB_TRAIN_IDS)} 段): {len(X_tr)}")
+    X_tr, Y_tr = build_samples(seqs_tr, mu, std, tunnel_aug=True)
+    print(f"  训练样本 + 隧道增强 ({len(CALIB_TRAIN_IDS)} 段): {len(X_tr)}")
     if seqs_val:
-        X_val, Y_val = build_samples(seqs_val, mu, std)
+        X_val, Y_val = build_samples(seqs_val, mu, std, tunnel_aug=False)
         print(f"  {CALIB_VAL_ID} 验证样本: {len(X_val)}")
     else:
         idx = np.random.permutation(len(X_tr))

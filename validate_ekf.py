@@ -356,11 +356,6 @@ def plot_results(seq, dr_x, dr_y, dr_h,
     dr_err = np.sqrt((drx[idx_v] - tx[idx_v]) ** 2 + (dry[idx_v] - ty[idx_v]) ** 2)
     ekf_err = np.sqrt((ex[idx_v] - tx[idx_v]) ** 2 + (ey[idx_v] - ty[idx_v]) ** 2)
 
-    # —— 车体速度 & 横向速度（用于子图 d）——
-    ekf_spd = np.sqrt(ekf_vx ** 2 + ekf_vy ** 2)
-    v_lat = np.zeros(len(tg), np.float32)
-    for k in range(len(tg)):
-        _, v_lat[k] = enu_to_body(float(ekf_vx[k]), float(ekf_vy[k]), float(ekf_h[k]))
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle(f'GNSS/INS/Wheel 6-State EKF 验证 ({timestamp})', fontsize=14, fontweight='bold')
@@ -420,25 +415,26 @@ def plot_results(seq, dr_x, dr_y, dr_h,
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.35)
 
-    # (d) 速度诊断（原零偏估计替换）
+    # (d) 零偏预测
     ax = axes[1, 1]
-    ax.plot(t_rel, seq['v_ms'], 'g-', lw=1.0, alpha=0.7, label='Wheel speed')
-    ax.plot(t_rel, ekf_spd, 'b-', lw=1.2, label='EKF speed (√(vx²+vy²))')
-    ax.plot(t_rel, v_lat, 'r-', lw=0.8, alpha=0.6, label='v_lat (body)')
+    ax.plot(t_rel, net_bias * RAD2DEG, 'b-', lw=1.2, label='BiasNet 预测')
+    ax.plot(t_rel, ekf_bg * RAD2DEG, 'r-', lw=0.8, alpha=0.7, label='EKF 残差估计')
+    # 合成总零偏 = BiasNet 预测 + EKF 残差
+    total_bias = net_bias * RAD2DEG + ekf_bg * RAD2DEG
+    ax.plot(t_rel, total_bias, 'g-', lw=0.6, alpha=0.5, label='合计零偏')
     ax.axhline(0, color='k', ls='--', lw=0.4)
     if loss_start_idx is not None:
         ax.axvspan(t_rel[loss_start_idx], t_rel[min(loss_end_idx, len(t_rel) - 1)],
                    alpha=0.08, color='orange')
     ax.set_xlabel('时间 (s)')
-    ax.set_ylabel('速度 (m/s)')
-    ax.set_title('速度诊断：EKF speed / Wheel / v_lat')
+    ax.set_ylabel('零偏 (°/s)')
+    ax.set_title('陀螺零偏：BiasNet 预测 vs EKF 残差')
     ax.legend(fontsize=8, loc='upper left')
     ax.grid(True, alpha=0.35)
-    # 右侧显示统计
     stats_text = (
-        f"EKF speed: μ={np.mean(ekf_spd):.2f} σ={np.std(ekf_spd):.2f}\n"
-        f"Wheel    : μ={np.mean(seq['v_ms']):.2f} σ={np.std(seq['v_ms']):.2f}\n"
-        f"v_lat    : μ={np.mean(v_lat):.4f} σ={np.std(v_lat):.3f}  max|.|={np.max(np.abs(v_lat)):.3f}"
+        f"BiasNet: μ={np.mean(net_bias*RAD2DEG):.3f} σ={np.std(net_bias*RAD2DEG):.3f}\n"
+        f"EKF bg:  μ={np.mean(ekf_bg*RAD2DEG):.4f} σ={np.std(ekf_bg*RAD2DEG):.4f}\n"
+        f"合计:    μ={np.mean(total_bias):.3f} σ={np.std(total_bias):.3f}"
     )
     ax.text(0.98, 0.97, stats_text, transform=ax.transAxes, fontsize=7.5,
             verticalalignment='top', horizontalalignment='right',

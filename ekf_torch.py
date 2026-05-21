@@ -20,6 +20,95 @@ N_STATE = 6
 
 
 # ============================================================================
+# BiasNet (PyTorch) — 与 Keras 版架构一致，7通道输入
+# ============================================================================
+
+class BiasNetTorch(nn.Module):
+    """
+    与 Keras 版 BiasNet 架构完全一致。
+    输入: (batch, window, 7) — [AccX/Y/Z, GyroX/Y/Z, VehicleSpeed_ms]
+    输出: (batch, 1) — 陀螺 Z 零偏 (rad/s)
+    """
+    def __init__(self, window_size=30, in_channels=7):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, 32, 5, padding='same')
+        self.conv2 = nn.Conv1d(32, 32, 5, dilation=4, padding='same')
+        self.conv3 = nn.Conv1d(32, 16, 3, padding='same')
+        self.fc1 = nn.Linear(16, 32)
+        self.drop = nn.Dropout(0.2)
+        self.out = nn.Linear(32, 1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # x: (B, W, C) → (B, C, W)
+        x = x.permute(0, 2, 1)
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.relu(self.conv3(x))
+        x = x.mean(dim=-1)  # GlobalAvgPool1d
+        x = self.relu(self.fc1(x))
+        x = self.drop(x)
+        x = self.out(x)
+        return x.squeeze(-1)  # (B,)
+
+
+def export_biasnet_torch_to_keras(torch_model, output_path, window_size=30, in_channels=7):
+    """PyTorch BiasNet → Keras .weights.h5"""
+    import tensorflow as tf
+    from tensorflow.keras import layers, Model
+
+    class KerasBiasNet(Model):
+        def __init__(self):
+            super().__init__(name='BiasNet')
+            self.conv1 = layers.Conv1D(32, 5, padding='causal', activation='relu')
+            self.conv2 = layers.Conv1D(32, 5, dilation_rate=4, padding='causal', activation='relu')
+            self.conv3 = layers.Conv1D(16, 3, padding='causal', activation='relu')
+            self.pool = layers.GlobalAveragePooling1D()
+            self.fc1 = layers.Dense(32, activation='relu')
+            self.drop = layers.Dropout(0.2)
+            self.out = layers.Dense(1, activation='linear')
+
+        def call(self, x, training=False):
+            h = self.conv1(x)
+            h = self.conv2(h)
+            h = self.conv3(h)
+            h = self.pool(h)
+            h = self.fc1(h)
+            h = self.drop(h, training=training)
+            return self.out(h)
+
+    keras_model = KerasBiasNet()
+    dummy = np.zeros((1, window_size, in_channels), dtype=np.float32)
+    keras_model(dummy)
+
+    pt = torch_model.state_dict()
+    keras_model.conv1.set_weights([
+        pt['conv1.weight'].permute(2, 1, 0).cpu().numpy(),
+        pt['conv1.bias'].cpu().numpy(),
+    ])
+    keras_model.conv2.set_weights([
+        pt['conv2.weight'].permute(2, 1, 0).cpu().numpy(),
+        pt['conv2.bias'].cpu().numpy(),
+    ])
+    keras_model.conv3.set_weights([
+        pt['conv3.weight'].permute(2, 1, 0).cpu().numpy(),
+        pt['conv3.bias'].cpu().numpy(),
+    ])
+    keras_model.fc1.set_weights([
+        pt['fc1.weight'].T.cpu().numpy(),
+        pt['fc1.bias'].cpu().numpy(),
+    ])
+    keras_model.out.set_weights([
+        pt['out.weight'].T.cpu().numpy(),
+        pt['out.bias'].cpu().numpy(),
+    ])
+
+    keras_model.save_weights(str(output_path))
+    print(f"[Export] BiasNet 权重已导出到 {output_path}")
+    return keras_model
+
+
+# ============================================================================
 # CovAdapterNet (PyTorch)
 # ============================================================================
 

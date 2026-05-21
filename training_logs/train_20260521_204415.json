@@ -1,0 +1,30 @@
+{
+  "timestamp": "20260521_204415",
+  "config": {
+    "q_yaw": 2e-05,
+    "q_vel": 0.0009,
+    "q_bg": 1e-08,
+    "q_pos": 1e-06,
+    "r_gps_xy": 4.0,
+    "r_wheel": 0.0144,
+    "r_nhc": 0.0036,
+    "nhc_yaw_rate_thresh": 0.12,
+    "nhc_r_scale_turn": 50.0,
+    "biasnet_max_deg": 2.0,
+    "freeze_yaw_below_ms": 0.5
+  },
+  "training": {
+    "train_samples": 11533,
+    "val_samples": 2228,
+    "epochs_completed": 35,
+    "best_epoch": 20,
+    "best_val_loss": 0.0003333836211822927,
+    "best_val_mae_rads": 0.01693730428814888,
+    "best_val_mae_degs": 0.970436052039762
+  },
+  "prediction": {
+    "residual_mean_degs": -0.2421412616968155,
+    "residual_std_degs": 1.459532618522644,
+    "residual_p95_degs": 3.0210189819335938
+  }
+}

@@ -39,8 +39,8 @@
       "std": 0.35084627445346056
     }
   },
-  "train_samples": 11533,
+  "train_samples": 23066,
   "val_samples": 2228,
-  "best_val_mae_rads": 0.018094899132847786,
-  "best_val_mae_degs": 1.0367613510271112
+  "best_val_mae_rads": 0.017193958163261414,
+  "best_val_mae_degs": 0.9851412358793878
 }

@@ -1,0 +1,38 @@
+{
+  "timestamp": "20260521_221712",
+  "config": {
+    "lr": 0.0003,
+    "epochs": 20,
+    "grad_clip": 1.0,
+    "chunk_size": 80
+  },
+  "ekf_config": {
+    "q_pos": 1e-06,
+    "q_vel": 0.0009,
+    "q_yaw": 2e-05,
+    "q_bg": 1e-08,
+    "r_gps_xy": 4.0,
+    "r_nhc": 0.0036,
+    "r_wheel": 0.0144,
+    "p_init_pos": 100.0,
+    "p_init_vel": 1.0,
+    "p_init_yaw": 0.09,
+    "p_init_bg": 1e-06,
+    "min_speed_wheel_ms": 0.5,
+    "min_speed_nhc_ms": 0.5,
+    "freeze_yaw_below_ms": 0.5,
+    "beta_noise_scale": 3.0
+  },
+  "training": {
+    "datasets": [
+      "Data01",
+      "Data02",
+      "Data03",
+      "Data04",
+      "Data06"
+    ],
+    "sequences": 5,
+    "best_loss": 0.08629453629255295,
+    "final_epoch": 20
+  }
+}
