@@ -1,16 +1,19 @@
 """
-EKF 二维地面车辆 GNSS/INS/Wheel 融合导航 + BiasNet 陀螺零偏预测
+EKF 二维地面车辆 GNSS/INS/Wheel 融合导航 + BiasNet 6 轴零偏预测
 
-状态 x = [px, py, vx, vy, yaw, bg]^T
-  px, py : ENU 位置 (m)
-  vx, vy : ENU 速度 (m/s)
-  yaw    : 航向 (rad, 东为 0, 逆时针为正)
-  bg     : 陀螺 Z 残余零偏 (rad/s)，BiasNet 已扣除主零偏
+状态 x = [px, py, vx, vy, yaw, bgx, bgy, bgz, bax, bay, baz, vel_scale]^T  (12维)
+  px, py  : ENU 位置 (m)
+  vx, vy  : ENU 速度 (m/s)
+  yaw     : 航向 (rad, 东为 0, 逆时针为正)
+  bgx/y/z : 陀螺残余零偏 (rad/s)，BiasNet 已扣除主零偏
+  bax/y/z : 加速度计残余零偏 (g)，BiasNet 已扣除主零偏
+  vel_scale : 轮速比例因子 (无量纲)
 
 量测更新:
   - GNSS 位置 (px, py)
-  - 轮速前向 v_fwd = vx*cos(yaw)+vy*sin(yaw) ≈ v_wheel
+  - 轮速前向 v_fwd = vx*cos(yaw)+vy*sin(yaw) ≈ v_wheel * vel_scale
   - NHC 横向 v_lat ≈ 0（转弯时动态放宽 R）
+  - 加速度计前向伪量测（约束 ba_x）
 """
 
 from __future__ import annotations
@@ -25,9 +28,13 @@ from config import EKFConfig, DEFAULT_EKF_CONFIG
 
 DEG2RAD = np.pi / 180.0
 RAD2DEG = 180.0 / np.pi
+GRAVITY = 9.80665          # m/s² per g
 EPS = 1e-8
-N_STATE = 6
-IDX_PX, IDX_PY, IDX_VX, IDX_VY, IDX_YAW, IDX_BG = range(6)
+N_STATE = 12
+IDX_PX, IDX_PY, IDX_VX, IDX_VY, IDX_YAW = 0, 1, 2, 3, 4
+IDX_BGX, IDX_BGY, IDX_BGZ = 5, 6, 7
+IDX_BAX, IDX_BAY, IDX_BAZ = 8, 9, 10
+IDX_VEL_SCALE = 11
 
 
 def wrap_angle(angle: float) -> float:
@@ -60,6 +67,20 @@ def clip_biasnet_output(raw: np.ndarray, max_deg: float) -> np.ndarray:
     return (max_deg * np.tanh(raw)).astype(np.float32)
 
 
+def clip_biasnet_6d(raw: np.ndarray, max_acc_g: float, max_gyro_deg: float) -> np.ndarray:
+    """
+    BiasNet 6 维输出 → 物理量
+    前3通道 (acc): ±max_acc_g [g]
+    后3通道 (gyro): ±max_gyro_deg [deg/s]
+    返回 (N, 6) 或 (6,) float32
+    """
+    raw = np.atleast_2d(raw) if raw.ndim == 1 else raw
+    out = np.zeros_like(raw, dtype=np.float32)
+    out[:, 0:3] = max_acc_g * np.tanh(raw[:, 0:3])      # acc bias [g]
+    out[:, 3:6] = max_gyro_deg * np.tanh(raw[:, 3:6])   # gyro bias [deg/s]
+    return out.squeeze()
+
+
 def simulate_gnss_outage(
     gps_valid: np.ndarray,
     time_s: np.ndarray,
@@ -74,10 +95,14 @@ def simulate_gnss_outage(
     gps_valid_new, i_start, i_end
     """
     gps_v = gps_valid.copy()
+    n = len(time_s)
+    if n == 0:
+        return gps_v, 0, 0
     t0 = float(time_s[0])
     i0 = int(np.searchsorted(time_s - t0, start_time))
     i1 = int(np.searchsorted(time_s - t0, end_time))
-    i1 = min(max(i1, i0 + 1), len(time_s))
+    i0 = min(max(i0, 0), n - 1)
+    i1 = min(max(i1, i0 + 1), n)
     gps_v[i0:i1] = False
     return gps_v, i0, i1
 
@@ -88,8 +113,10 @@ def simulate_gnss_outage(
 
 class BiasNet(Model):
     """
-    输入：归一化后的 IMU 窗口  (batch, window, 6)
-    输出：(batch, 1) — 陀螺 Z 零偏 b̂_ω (rad/s)
+    输入：归一化后的 IMU 窗口  (batch, window, 7)
+    输出：(batch, 6) — [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z]
+      ba_x/y/z : 加速度计零偏 [g]
+      bg_x/y/z : 陀螺零偏 [rad/s]（原始输出为 deg/s，由 clip_biasnet_6d 转换）
     """
 
     def __init__(self, window_size: int = 30):
@@ -101,7 +128,7 @@ class BiasNet(Model):
         self.pool = layers.GlobalAveragePooling1D()
         self.fc1 = layers.Dense(32, activation='relu')
         self.drop = layers.Dropout(0.2)
-        self.out = layers.Dense(1, activation='linear')
+        self.out = layers.Dense(6, activation='linear')   # 6 维: 3 acc + 3 gyro
 
     def call(self, x, training=False):
         h = self.conv1(x)
@@ -175,22 +202,27 @@ def map_noise_scale(z: np.ndarray, sigma_base: float, beta: float = 3.0) -> np.n
 
 class EKF6D:
     """
-    完整二维 GNSS/INS/Wheel 扩展卡尔曼滤波器。
+    完整二维 GNSS/INS/Wheel 扩展卡尔曼滤波器（12 状态）。
 
-    过程模型（vx, vy 为状态，轮速仅作量测）:
-      ψ_{k+1} = wrap(ψ_k + (ω_z - b_net - b_g) dt)
-      [vx, vy]_{k+1} = R(Δψ) [vx, vy]_k^T     # 航向变化时旋转 ENU 速度
-      px_{k+1} = px_k + vx_k dt
-      py_{k+1} = py_k + vy_k dt
-      b_g 随机游走
+    过程模型（加速度计积分速度）:
+      ψ_{k+1} = wrap(ψ_k + (ω_z - b_net_z - b_gz) dt)
+      a_body  = (accel_meas - ba_total) * g0        # 修正后加速度 [m/s²]
+      a_enu   = R(yaw) @ a_body[:2]                  # 旋转到 ENU
+      v_{k+1} = v_k + a_enu * dt                     # 加速度计积分
+      p_{k+1} = p_k + v_k * dt
+      零偏随机游走
 
     量测:
-      GNSS → (px, py); 轮速 → ||v||;  NHC → v_lat ≈ 0
+      GNSS → (px, py); 轮速 → v_fwd ≈ v_wheel;
+      NHC → v_lat ≈ 0; 加速度计前向 → 约束 ba_x
     """
 
     def __init__(self, cfg: EKFConfig = None, x0: np.ndarray = None, P0: np.ndarray = None):
         self.cfg = cfg if cfg is not None else DEFAULT_EKF_CONFIG
         self.x = np.zeros(N_STATE, dtype=np.float64) if x0 is None else np.asarray(x0, dtype=np.float64)
+        # 确保 vel_scale 初始化为 1
+        if x0 is None:
+            self.x[IDX_VEL_SCALE] = 1.0
         if P0 is not None:
             self.P = np.asarray(P0, dtype=np.float64)
         else:
@@ -198,7 +230,10 @@ class EKF6D:
             self.P = np.diag([
                 c.p_init_pos, c.p_init_pos,
                 c.p_init_vel, c.p_init_vel,
-                c.p_init_yaw, c.p_init_bg,
+                c.p_init_yaw,
+                c.p_init_bg_xy, c.p_init_bg_xy, c.p_init_bg,
+                c.p_init_ba, c.p_init_ba, c.p_init_ba,
+                0.05 ** 2,   # vel_scale 初始方差（~5%不确定，允许估计比例因子）
             ]).astype(np.float64)
 
     # ---- 协方差维护 ----
@@ -218,53 +253,102 @@ class EKF6D:
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
         self._symmetrize_P()
 
-    # ---- 时间更新（禁止用轮速覆盖 vx, vy）----
-    def predict(self, gyro_z_rad: float, bias_net: float, dt: float,
+    # ---- 时间更新（加速度计积分速度）----
+    def predict(self, gyro_meas: np.ndarray, accel_meas: np.ndarray,
+                bias_net: np.ndarray, dt: float,
                 freeze_yaw: bool = False):
         """
-        gyro_z_rad : 原始陀螺 Z (rad/s)
-        bias_net   : BiasNet 预测零偏 (rad/s)，不写入状态
+        gyro_meas  : (3,) 陀螺三轴 [rad/s]
+        accel_meas : (3,) 加速度计三轴 [g]
+        bias_net   : (6,) BiasNet 前馈零偏 [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z]
+                     单位: ba [g], bg [deg/s]
         dt         : 时间步长 (s)
-        freeze_yaw : True 时不积分航向（零速/停车，避免陀螺零偏积到 yaw）
+        freeze_yaw : True 时不积分航向（零速/停车）
         """
-        px, py, vx, vy, yaw, bg = self.x
+        px, py, vx, vy, yaw = self.x[:5]
+        bgx, bgy, bgz = self.x[IDX_BGX], self.x[IDX_BGY], self.x[IDX_BGZ]
+        bax, bay, baz = self.x[IDX_BAX], self.x[IDX_BAY], self.x[IDX_BAZ]
+        vel_scale = self.x[IDX_VEL_SCALE]
+
+        # 总零偏 = BiasNet 前馈 + EKF 残余估计
+        ba_net = bias_net[0:3].astype(np.float64)                         # [g]
+        bg_net = bias_net[3:6].astype(np.float64) * DEG2RAD               # deg/s → rad/s
+        ba_total = ba_net + np.array([bax, bay, baz])                     # [g]
+        bg_total = bg_net + np.array([bgx, bgy, bgz])                     # [rad/s]
+
+        # 1. 航向积分（修正陀螺 Z）
         if freeze_yaw:
             dpsi = 0.0
         else:
-            omega = float(gyro_z_rad) - float(bias_net) - bg
-            dpsi = omega * dt
-        c, s = np.cos(dpsi), np.sin(dpsi)
-
-        # 位置：用当前 ENU 速度积分
-        px_new = px + vx * dt
-        py_new = py + vy * dt
-        # 速度：随航向变化旋转（协调转弯），不由轮速强制赋值
-        vx_new = vx * c - vy * s
-        vy_new = vx * s + vy * c
+            gyro_z_corr = float(gyro_meas[2]) - float(bg_total[2])
+            dpsi = gyro_z_corr * dt
         yaw_new = wrap_angle(yaw + dpsi)
 
-        self.x = np.array([px_new, py_new, vx_new, vy_new, yaw_new, bg], dtype=np.float64)
+        # 2. 加速度计修正 [g] → [m/s²]
+        acc_corr_g = accel_meas.astype(np.float64) - ba_total             # (3,) [g]
+        acc_corr_x = float(acc_corr_g[0]) * GRAVITY                       # forward accel [m/s²]
 
-        # 雅可比 F
+        # 3. 速度传播（混合模式）
+        c_yaw, s_yaw = np.cos(yaw), np.sin(yaw)
+        #    协调转弯：旋转已有速度矢量，保持 |v| 不变（鲁棒）
+        c_dpsi, s_dpsi = np.cos(dpsi), np.sin(dpsi)
+        vx_rot = vx * c_dpsi - vy * s_dpsi
+        vy_rot = vx * s_dpsi + vy * c_dpsi
+
+        #    前向加速度修正：仅用 bias-corrected 前向加速度改变速率
+        #    （不使用横向加速度，由 NHC 量测约束）
+        #    accel_fusion_gain 控制融合强度（0=纯协调转弯，1=全加速度计积分）
+        alpha = self.cfg.accel_fusion_gain
+        a_fwd_enu_x = alpha * acc_corr_x * c_yaw
+        a_fwd_enu_y = alpha * acc_corr_x * s_yaw
+        vx_new = vx_rot + a_fwd_enu_x * dt
+        vy_new = vy_rot + a_fwd_enu_y * dt
+
+        # 4. 位置积分
+        px_new = px + vx * dt
+        py_new = py + vy * dt
+
+        # 5. 零偏随机游走
+        self.x = np.array([
+            px_new, py_new, vx_new, vy_new, yaw_new,
+            bgx, bgy, bgz, bax, bay, baz, vel_scale,
+        ], dtype=np.float64)
+
+        # ---- 雅可比 F (12×12) ----
+        # 速度模型:
+        #   vx_new = vx*c_dpsi - vy*s_dpsi + acc_corr_x*c_yaw*dt
+        #   vy_new = vx*s_dpsi + vy*c_dpsi + acc_corr_x*s_yaw*dt
+        #   acc_corr_x = (acc_x_meas - ba_total_x) * GRAVITY
         F = np.eye(N_STATE, dtype=np.float64)
+        # 位置 → 速度
         F[IDX_PX, IDX_VX] = dt
         F[IDX_PY, IDX_VY] = dt
-        F[IDX_VX, IDX_VX] = c
-        F[IDX_VX, IDX_VY] = -s
-        F[IDX_VY, IDX_VX] = s
-        F[IDX_VY, IDX_VY] = c
-        # ∂vx+/∂bg, ∂vy+/∂bg 通过 dpsi
-        dvx_dbg = (vx * s + vy * c) * dt
-        dvy_dbg = (-vx * c + vy * s) * dt
-        F[IDX_VX, IDX_BG] = dvx_dbg
-        F[IDX_VY, IDX_BG] = dvy_dbg
-        F[IDX_YAW, IDX_BG] = -dt
+        # 速度 → vx, vy（协调转弯旋转）
+        F[IDX_VX, IDX_VX] = c_dpsi
+        F[IDX_VX, IDX_VY] = -s_dpsi
+        F[IDX_VY, IDX_VX] = s_dpsi
+        F[IDX_VY, IDX_VY] = c_dpsi
+        # 速度 → yaw（前向加速度旋转到 ENU，受 alpha 缩放）
+        F[IDX_VX, IDX_YAW] = -alpha * acc_corr_x * s_yaw * dt
+        F[IDX_VY, IDX_YAW] = alpha * acc_corr_x * c_yaw * dt
+        # 速度 → bgz（通过 dpsi 影响速度旋转）
+        F[IDX_VX, IDX_BGZ] = (vx * s_dpsi + vy * c_dpsi) * dt
+        F[IDX_VY, IDX_BGZ] = (-vx * c_dpsi + vy * s_dpsi) * dt
+        # 速度 → ba_x（前向加速度零偏，受 alpha 缩放）
+        F[IDX_VX, IDX_BAX] = -alpha * c_yaw * GRAVITY * dt
+        F[IDX_VY, IDX_BAX] = -alpha * s_yaw * GRAVITY * dt
+        # 航向 → bgz
+        if not freeze_yaw:
+            F[IDX_YAW, IDX_BGZ] = -dt
 
         c_cfg = self.cfg
         Q = np.diag([
             c_cfg.q_pos, c_cfg.q_pos,
             c_cfg.q_vel, c_cfg.q_vel,
-            c_cfg.q_yaw, c_cfg.q_bg,
+            c_cfg.q_yaw,
+            c_cfg.q_bg_xy, c_cfg.q_bg_xy, c_cfg.q_bg,
+            c_cfg.q_ba, c_cfg.q_ba, c_cfg.q_ba,
+            c_cfg.q_vel_scale,
         ])
         self.P = F @ self.P @ F.T + Q
         self._symmetrize_P()
@@ -298,22 +382,45 @@ class EKF6D:
         R = np.array([[r]], dtype=np.float64)
         self._joseph_update(H, innov, R)
 
-    # ---- 轮速：车体前向速度量测（优于仅用标量速率，可约束方向）----
+    # ---- 轮速：车体前向速度量测 ----
     def update_wheel_forward(self, v_wheel: float, r_wheel: float = None):
         """
-        h(x) = v_fwd - v_wheel = (vx*cos(yaw) + vy*sin(yaw)) - v_wheel ≈ 0
-        不覆盖 vx,vy，仅通过 EKF 校正。
+        h(x) = v_fwd - v_wheel * vel_scale ≈ 0
+          v_fwd = vx*cos(yaw) + vy*sin(yaw)   (EKF 估计的车体前向速度)
+        vel_scale 不在此量测中更新（用 update_wheel_scale 单独估计）。
         """
         r = r_wheel if r_wheel is not None else self.cfg.r_wheel
         yaw = self.x[IDX_YAW]
         vx, vy = self.x[IDX_VX], self.x[IDX_VY]
+        vel_scale = self.x[IDX_VEL_SCALE]
         c, s = np.cos(yaw), np.sin(yaw)
         v_fwd = vx * c + vy * s
-        innov = np.array([float(v_wheel) - v_fwd])
+        v_wheel_corrected = float(v_wheel) * float(vel_scale)
+        innov = np.array([v_wheel_corrected - v_fwd])
         H = np.zeros((1, N_STATE))
         H[0, IDX_VX] = c
         H[0, IDX_VY] = s
         H[0, IDX_YAW] = -vx * s + vy * c
+        # vel_scale 不在此更新，避免与 vx/vy/yaw 不可区分
+        R = np.array([[r]], dtype=np.float64)
+        self._joseph_update(H, innov, R)
+
+    # ---- 轮速比例因子估计（GPS 速度 / 轮速）----
+    def update_wheel_scale(self, gps_speed_ms: float, v_wheel: float,
+                           r_scale: float = None):
+        """
+        直接观测 vel_scale = v_gps / v_wheel。
+        仅 GPS 有效且速度足够时调用，解耦于速度状态。
+        """
+        r = r_scale if r_scale is not None else 0.05 ** 2  # 5% 观测噪声（GPS 差分速度有噪声）
+        if v_wheel < 0.5:
+            return
+        z_scale = float(gps_speed_ms) / float(v_wheel)
+        z_scale = float(np.clip(z_scale, 0.5, 2.0))  # 防异常值
+        vel_scale = self.x[IDX_VEL_SCALE]
+        innov = np.array([z_scale - vel_scale])
+        H = np.zeros((1, N_STATE))
+        H[0, IDX_VEL_SCALE] = 1.0
         R = np.array([[r]], dtype=np.float64)
         self._joseph_update(H, innov, R)
 
@@ -354,6 +461,26 @@ class EKF6D:
         H[0, IDX_YAW] = -vx * cs - vy * sn
         self._joseph_update(H, innov, R)
 
+    # ---- 加速度计前向量测（约束 ba_x）----
+    def update_accel_forward(self, acc_x_g: float, dv_wheel_dt: float,
+                             r_accel: float = None):
+        """
+        利用轮速导数观测加速度计 X 轴零偏 ba_x：
+          dv_wheel/dt ≈ (acc_x - ba_x) * g0
+          → ba_x ≈ acc_x - dv_wheel/dt / g0
+
+        z = acc_x_g - dv_wheel_dt / g0  (观测到的 ba_x)
+        h(x) = bax                       (状态估计的 ba_x)
+        """
+        r = r_accel if r_accel is not None else self.cfg.r_accel
+        z_ba_x = acc_x_g - dv_wheel_dt / GRAVITY     # 观测 ba_x [g]
+        bax = self.x[IDX_BAX]
+        innov = np.array([z_ba_x - bax])
+        H = np.zeros((1, N_STATE))
+        H[0, IDX_BAX] = 1.0
+        R = np.array([[r]], dtype=np.float64)
+        self._joseph_update(H, innov, R)
+
     # ---- 状态访问 ----
     @property
     def px(self) -> float:
@@ -377,7 +504,17 @@ class EKF6D:
 
     @property
     def bg(self) -> float:
-        return float(self.x[IDX_BG])
+        return float(self.x[IDX_BGZ])
+
+    @property
+    def bg_vec(self) -> np.ndarray:
+        """返回陀螺三轴残余零偏 [rad/s]"""
+        return self.x[IDX_BGX:IDX_BGZ+1].copy()
+
+    @property
+    def ba_vec(self) -> np.ndarray:
+        """返回加速度计三轴残余零偏 [g]"""
+        return self.x[IDX_BAX:IDX_BAZ+1].copy()
 
 
 # 向后兼容：旧 2 状态航向 EKF 名称保留为别名（新代码请用 EKF6D）
@@ -410,23 +547,15 @@ class EKFNavigatorNP:
         self.norm_stats = norm_stats
         self.ekf_config = ekf_config if ekf_config is not None else DEFAULT_EKF_CONFIG
 
-        # BiasNet 输入: 6 IMU 通道 + 1 轮速通道
+        # BiasNet 输入: 6 IMU 通道 + 1 轮速通道 = 7
         self.biasnet = BiasNet(window_size)
         dummy = np.zeros((1, window_size, 7), dtype=np.float32)
         self.biasnet(dummy)
         wp = str(weights_path)
         if not wp.endswith('.weights.h5'):
             wp += '.weights.h5'
-        try:
-            self.biasnet.load_weights(wp)
-            print(f"[EKFNavigator] BiasNet (7ch) 加载成功：{weights_path}")
-        except Exception:
-            # 兼容旧版6通道权重
-            self.biasnet = BiasNet(window_size)
-            dummy_6ch = np.zeros((1, window_size, 6), dtype=np.float32)
-            self.biasnet(dummy_6ch)
-            self.biasnet.load_weights(wp)
-            print(f"[EKFNavigator] BiasNet (6ch 兼容) 加载成功：{weights_path}")
+        self.biasnet.load_weights(wp)
+        print(f"[EKFNavigator] BiasNet (6D 输出) 加载成功：{weights_path}")
 
         # CovAdapterNet（可选）
         self.cov_adapter = None
@@ -455,18 +584,24 @@ class EKFNavigatorNP:
         return out
 
     def _predict_bias(self, imu_norm: np.ndarray) -> np.ndarray:
-        """BiasNet → tanh 限幅 ±biasnet_max_deg deg/s → rad/s。"""
+        """
+        BiasNet → 6 维物理量 [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z]
+          前3通道: acc bias [g]
+          后3通道: gyro bias [deg/s]（调用方自行转 rad/s）
+        返回 (T, 6) float32
+        """
         T = len(imu_norm)
         W = self.window_size
-        bias = np.zeros(T, dtype=np.float32)
+        bias = np.zeros((T, 6), dtype=np.float32)
         if T < W:
             return bias
         windows = np.stack(
             [imu_norm[i: i + W] for i in range(T - W + 1)], axis=0)
         raw = self.biasnet(windows.astype(np.float32),
-                           training=False).numpy().flatten()
-        bias_deg = clip_biasnet_output(raw, self.ekf_config.biasnet_max_deg)
-        bias[W - 1:] = bias_deg * DEG2RAD
+                           training=False).numpy()            # (N, 6)
+        bias_phys = clip_biasnet_6d(raw, self.ekf_config.biasnet_max_acc_g,
+                                    self.ekf_config.biasnet_max_deg)
+        bias[W - 1:] = bias_phys.astype(np.float32)
         return bias
 
     def _predict_noise(self, imu_norm: np.ndarray) -> np.ndarray:
@@ -504,12 +639,10 @@ class EKFNavigatorNP:
     def _init_state(self, gps_x, gps_y, gps_v, v_ms, gps_theta, gyro_z, net_bias,
                      dt=0.1, time_s=None):
         """
-        初始化状态并确定 EKF 循环起始帧 k0。
+        初始化 12 维状态并确定 EKF 循环起始帧 k0。
 
-        车辆静止启动时：
-          - 位置来自首个有效 GNSS 帧
-          - 航向来自首次运动的 GPS 位移
-          - k0 设在首次运动帧，避免静止期协方差膨胀
+        net_bias: (T, 6) — BiasNet 6 维前馈零偏 [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z]
+                  单位: ba [g], bg [deg/s]
         """
         cfg = self.ekf_config
         min_hdg_ms = 5.0 / 3.6  # 5 km/h
@@ -517,7 +650,9 @@ class EKFNavigatorNP:
 
         ok = np.where(gps_v & np.isfinite(gps_x) & np.isfinite(gps_y))[0]
         if len(ok) == 0:
-            return np.zeros(N_STATE), 0
+            x0 = np.zeros(N_STATE)
+            x0[IDX_VEL_SCALE] = 1.0
+            return x0, 0
         k0_gps = int(ok[0])
 
         # 位置：用首个有效 GNSS 帧
@@ -526,12 +661,10 @@ class EKFNavigatorNP:
         v0 = float(v_ms[k0_gps]) if np.isfinite(v_ms[k0_gps]) else 0.0
 
         # ---- 航向初始化 ----
-        # 优先用 GPS 航向（即使静止，gps_theta 已有平滑值）
         yaw0 = 0.0
         if np.isfinite(gps_theta[k0_gps]) and abs(gps_theta[k0_gps]) > 1e-6:
             yaw0 = float(gps_theta[k0_gps])
         else:
-            # 退而求其次：用运动段 GPS 位移推算
             moving = np.where((v_ms >= min_hdg_ms)
                               & np.isfinite(gps_x) & np.isfinite(gps_y))[0]
             if len(moving) > 0:
@@ -542,11 +675,11 @@ class EKFNavigatorNP:
                     i_end = min(i_m + 10, len(gps_x) - 1)
                     dx = float(gps_x[i_end] - gps_x[i_m])
                     dy = float(gps_y[i_end] - gps_y[i_m])
-                    if dx * dx + dy * dy > 1.0:  # ≥ 1m 位移（放宽条件）
+                    if dx * dx + dy * dy > 1.0:
                         yaw0 = float(np.arctan2(dy, dx))
 
-        # ---- 从静止或 GPS 位移推算初始零偏 ----
-        bg0 = 0.0
+        # ---- 从静止时段估计陀螺 Z 初始残余零偏 ----
+        bgz0 = 0.0
 
         # 1) 静止时段估计：v_ms ~ 0 时 gyro_z ≈ 零偏
         still = (np.abs(v_ms) < 0.1) & np.isfinite(gyro_z) & gps_v
@@ -555,8 +688,10 @@ class EKFNavigatorNP:
             gaps = np.diff(still_idx)
             long_run = np.where(gaps <= 3)[0]
             if len(long_run) >= 5:
-                bg0 = float(np.median(gyro_z[still_idx]))
-                bg0 = np.clip(bg0, -cfg.bg_init_max_bg_rads, cfg.bg_init_max_bg_rads)
+                # 扣除 BiasNet 前馈后的残余
+                nb_z = net_bias[still_idx, 5] * DEG2RAD  # deg/s → rad/s
+                bgz0 = float(np.median(gyro_z[still_idx] - nb_z))
+                bgz0 = np.clip(bgz0, -cfg.bg_init_max_bg_rads, cfg.bg_init_max_bg_rads)
         else:
             # 2) 运动时段：用 GPS 位移推算
             high_spd = (gps_v & (v_ms >= cfg.bg_init_min_speed_ms)
@@ -588,16 +723,15 @@ class EKFNavigatorNP:
                         gyro_sum = 0.0
                         for j in range(i1, i2):
                             dt_j = float(time_s[j+1] - time_s[j]) if time_s is not None else dt
-                            nb = float(net_bias[j]) if np.isfinite(net_bias[j]) else 0.0
-                            gyro_sum += (float(gyro_z[j]) - nb) * dt_j
+                            nb_z = float(net_bias[j, 5]) * DEG2RAD if net_bias.shape[1] > 5 else 0.0
+                            gyro_sum += (float(gyro_z[j]) - nb_z) * dt_j
 
                         duraction_s = t2 - t1
                         if duraction_s > 1.0:
-                            bg0 = (gyro_sum - gps_delta) / duraction_s
-                            bg0 = np.clip(bg0, -cfg.bg_init_max_bg_rads, cfg.bg_init_max_bg_rads)
+                            bgz0 = (gyro_sum - gps_delta) / duraction_s
+                            bgz0 = np.clip(bgz0, -cfg.bg_init_max_bg_rads, cfg.bg_init_max_bg_rads)
 
         # ---- 确定 EKF 循环起始帧 ----
-        # 首帧静止 → 延迟到首次运动，避免长串预测使协方差膨胀
         if v0 < min_wheel_ms:
             motion = np.where((v_ms >= min_wheel_ms)
                               & np.isfinite(gps_x) & np.isfinite(gps_y))[0]
@@ -610,7 +744,11 @@ class EKFNavigatorNP:
 
         vk = float(v_ms[k0]) if np.isfinite(v_ms[k0]) else 0.0
         vx0, vy0 = body_to_enu(vk, 0.0, yaw0)
-        return np.array([px0, py0, vx0, vy0, wrap_angle(yaw0), bg0]), k0
+        x0 = np.zeros(N_STATE, dtype=np.float64)
+        x0[IDX_PX:IDX_YAW+1] = [px0, py0, vx0, vy0, wrap_angle(yaw0)]
+        x0[IDX_BGZ] = bgz0
+        x0[IDX_VEL_SCALE] = 1.0
+        return x0, k0
 
     def run(self,
             imu_raw: np.ndarray,
@@ -625,31 +763,44 @@ class EKFNavigatorNP:
             enable_wheel_meas: bool = True,
             enable_nhc: bool = True,
             enable_gnss_heading: bool = True,
+            enable_accel_meas: bool = True,
             ) -> tuple:
         """
         参数
         ----
-        imu_raw     : (T, 6) 原始 IMU
+        imu_raw     : (T, 6) 原始 IMU [AccX,Y,Z(g), GyroX,Y,Z(deg/s)]
         v_ms        : (T,) 车速 m/s（已 km/h→m/s）
-        gyro_z_rad  : (T,) 陀螺 Z rad/s
+        gyro_z_rad  : (T,) 陀螺 Z rad/s（向后兼容，从 imu_raw[:,5] 转换）
         gps_enu_x/y : (T,) GNSS ENU 位置 (m)
         gps_valid   : (T,) bool，False 时不做 GNSS 更新（含 outage 模拟）
         gps_theta   : (T,) 可选，用于初始化航向 + 航向量测
-        enable_gnss_heading : True 时在 GPS 有效时用 gps_theta 直接校正航向
 
         返回
         ----
-        enu_x, enu_y, headings, net_biases, vel_x, vel_y, ekf_bg
+        enu_x, enu_y, headings, net_biases, vel_x, vel_y, ekf_bgz,
+        ekf_bg_vec, ekf_ba_vec
+          net_biases   : (T, 6) BiasNet 6 维前馈 [ba_x,ba_y,ba_z, bg_x,bg_y,bg_z]
+          ekf_bgz      : (T,)  EKF 陀螺 Z 残余零偏 [rad/s]
+          ekf_bg_vec   : (T, 3) EKF 陀螺三轴残余零偏 [rad/s]
+          ekf_ba_vec   : (T, 3) EKF 加速度计三轴残余零偏 [g]
         """
         T = len(v_ms)
         if gps_theta is None:
             gps_theta = np.zeros(T, dtype=np.float32)
 
-        # 将轮速拼入 IMU 作为 BiasNet 第7通道（区分转弯 vs 零偏）
+        # 将轮速拼入 IMU 作为 BiasNet 第7通道
         imu_7ch = np.column_stack([imu_raw, v_ms]) if imu_raw.shape[1] == 6 else imu_raw
         imu_norm = self._normalize_imu(imu_7ch)
-        net_bias = self._predict_bias(imu_norm)
-        noise_r = self._predict_noise(imu_norm[:, :6])  # CovAdapterNet 只用 IMU 6 通道
+        net_bias = self._predict_bias(imu_norm)        # (T, 6)
+        noise_r = self._predict_noise(imu_norm[:, :6])
+
+        # 轮速导数（用于加速度计前向约束）
+        dv_wheel = np.zeros(T, dtype=np.float32)
+        if T > 1:
+            # 用中值滤波平滑后求导
+            from scipy.ndimage import median_filter
+            v_smooth = median_filter(v_ms, size=5)
+            dv_wheel[1:] = np.diff(v_smooth) / np.clip(np.diff(time_s) if time_s is not None else dt, 0.05, 0.5)
 
         x0, k_start = self._init_state(
             gps_enu_x, gps_enu_y, gps_valid, v_ms, gps_theta, gyro_z_rad, net_bias,
@@ -661,7 +812,10 @@ class EKFNavigatorNP:
         headings = np.zeros(T, np.float32)
         vel_x = np.zeros(T, np.float32)
         vel_y = np.zeros(T, np.float32)
-        ekf_bg = np.zeros(T, np.float32)
+        ekf_bgz = np.zeros(T, np.float32)
+        ekf_bg_vec = np.zeros((T, 3), np.float32)
+        ekf_ba_vec = np.zeros((T, 3), np.float32)
+        ekf_vel_scale = np.ones(T, np.float32)
 
         cfg = self.ekf_config
         for k in range(k_start, T):
@@ -671,30 +825,56 @@ class EKFNavigatorNP:
             else:
                 dt_k = float(dt)
 
-            gz = float(gyro_z_rad[k]) if np.isfinite(gyro_z_rad[k]) else 0.0
-            bn = float(net_bias[k]) if np.isfinite(net_bias[k]) else 0.0
+            # 陀螺三轴 [rad/s]，加速度计三轴 [g]
+            gyro_meas = np.array([
+                float(imu_raw[k, 3]) * DEG2RAD,
+                float(imu_raw[k, 4]) * DEG2RAD,
+                float(gyro_z_rad[k]) if np.isfinite(gyro_z_rad[k]) else 0.0,
+            ], dtype=np.float64)
+            accel_meas = np.array([
+                float(imu_raw[k, 0]),
+                float(imu_raw[k, 1]),
+                float(imu_raw[k, 2]),
+            ], dtype=np.float64)
+
+            bn = net_bias[k].astype(np.float64)        # (6,) [g, g, g, deg/s, deg/s, deg/s]
             vw = float(v_ms[k]) if np.isfinite(v_ms[k]) else 0.0
 
             still = vw < cfg.freeze_yaw_below_ms
-            ekf.predict(gz, bn, dt_k, freeze_yaw=still)
+            ekf.predict(gyro_meas, accel_meas, bn, dt_k, freeze_yaw=still)
             if still:
                 ekf.x[IDX_VX] = 0.0
                 ekf.x[IDX_VY] = 0.0
 
-            if (gps_valid[k] and np.isfinite(gps_enu_x[k])
-                    and np.isfinite(gps_enu_y[k])):
+            gps_ok_now = (gps_valid[k] and np.isfinite(gps_enu_x[k])
+                          and np.isfinite(gps_enu_y[k]))
+            if gps_ok_now:
                 ekf.update_gnss_position(float(gps_enu_x[k]), float(gps_enu_y[k]))
+                # 轮速比例因子：GPS 速度 / 轮速（前后帧都需 GPS 有效）
+                if (k > k_start and enable_wheel_meas
+                        and gps_valid[k - 1]
+                        and np.isfinite(gps_enu_x[k - 1])):
+                    gps_spd = float(np.hypot(
+                        gps_enu_x[k] - gps_enu_x[k - 1],
+                        gps_enu_y[k] - gps_enu_y[k - 1])) / max(dt_k, 0.05)
+                    if gps_spd > 0.5:
+                        ekf.update_wheel_scale(gps_spd, vw)
 
             if enable_wheel_meas and vw >= cfg.min_speed_wheel_ms:
-                r_wheel_dyn = float(noise_r[k, 1])  # 动态前向轮速噪声
+                r_wheel_dyn = float(noise_r[k, 1])
                 ekf.update_wheel_forward(vw, r_wheel=r_wheel_dyn)
 
             if enable_nhc and vw >= cfg.min_speed_nhc_ms:
-                yaw_rate = gz - bn - ekf.bg
-                r_nhc_dyn = float(noise_r[k, 0])  # 动态横向速度噪声
+                gn = bn[5] * DEG2RAD                                 # net gyro_z bias [rad/s]
+                yaw_rate = float(gyro_meas[2]) - gn - float(ekf.x[IDX_BGZ])
+                r_nhc_dyn = float(noise_r[k, 0])
                 ekf.update_nhc(yaw_rate=yaw_rate, r_nhc=r_nhc_dyn)
 
-            # 航向量测放在最后（NHC/轮速之后），避免被其他量测覆盖
+            # 加速度计前向约束（用轮速导数约束 ba_x）
+            if enable_accel_meas and vw >= cfg.min_speed_wheel_ms:
+                ekf.update_accel_forward(
+                    float(accel_meas[0]), float(dv_wheel[k]))
+
             if (enable_gnss_heading and gps_valid[k]
                     and np.isfinite(gps_theta[k])
                     and vw >= cfg.min_speed_wheel_ms):
@@ -705,18 +885,25 @@ class EKFNavigatorNP:
             headings[k] = ekf.yaw
             vel_x[k] = ekf.vx
             vel_y[k] = ekf.vy
-            ekf_bg[k] = ekf.bg
+            ekf_bgz[k] = float(ekf.x[IDX_BGZ])
+            ekf_bg_vec[k] = ekf.bg_vec.astype(np.float32)
+            ekf_ba_vec[k] = ekf.ba_vec.astype(np.float32)
+            ekf_vel_scale[k] = float(ekf.x[IDX_VEL_SCALE])
 
         # 初始化前帧用首帧状态填充
         if k_start > 0:
             headings[:k_start] = headings[k_start]
             vel_x[:k_start] = vel_x[k_start]
             vel_y[:k_start] = vel_y[k_start]
-            ekf_bg[:k_start] = ekf_bg[k_start]
+            ekf_bgz[:k_start] = ekf_bgz[k_start]
+            ekf_bg_vec[:k_start] = ekf_bg_vec[k_start]
+            ekf_ba_vec[:k_start] = ekf_ba_vec[k_start]
+            ekf_vel_scale[:k_start] = ekf_vel_scale[k_start]
             enu_x[:k_start] = enu_x[k_start]
             enu_y[:k_start] = enu_y[k_start]
 
-        return enu_x, enu_y, headings, net_bias, vel_x, vel_y, ekf_bg
+        return (enu_x, enu_y, headings, net_bias, vel_x, vel_y, ekf_bgz,
+                ekf_bg_vec, ekf_ba_vec, ekf_vel_scale)
 
 
 def load_norm_stats(path: str) -> dict:

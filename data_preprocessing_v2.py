@@ -36,7 +36,7 @@ GPS_MAX_SPEED_KMH  = 150.0     # GPS 跳点速度阈值
 MIN_SPEED_MS       = 0.5       # 低于此速度不计算 GPS 航向
 
 # 20260108 实车：Data01/02/03/04/06 训练+测试，Data05 验证（held-out）
-CALIB_TRAIN_IDS     = ["Data01", "Data02", "Data03", "Data04", "Data06"]
+CALIB_TRAIN_IDS     = ["Data01",  "Data04"]
 CALIB_VAL_ID        = "Data05"
 CALIB_ALL_IDS       = CALIB_TRAIN_IDS + [CALIB_VAL_ID]
 # 兼容旧变量名
@@ -237,6 +237,154 @@ def resolve_calibration_paths(data_dir, ds_id):
     return imu_f, spd_f, gps_f
 
 
+VALID_CALIB_YEAR = 2020   # 低于此年份视为无效占位（如 2000/1970/0）
+MIN_CALIB_DT     = TARGET_DT / 10.0   # 100Hz 原始序列最小时间步（秒）
+
+
+def make_time_monotonic(t, min_step=MIN_CALIB_DT):
+    """消除重复/回退时间戳，保证插值 abscissa 严格递增。"""
+    t = np.asarray(t, dtype=np.float64).copy()
+    for i in range(1, len(t)):
+        if t[i] <= t[i - 1]:
+            t[i] = t[i - 1] + min_step
+    return t
+
+
+def read_calibration_tab(path):
+    """读取标定 TSV，清理 BOM 列名。"""
+    df = pd.read_csv(path, sep='\t', skipinitialspace=True, encoding='utf-8-sig')
+    df.columns = [c.replace('ï»¿', '').strip() for c in df.columns]
+    return df
+
+
+def _time_prefix_cols(prefix):
+    """IMU / UTC 时间列名映射。"""
+    day_col = 'IMUTime_day' if prefix == 'IMU' else 'UTCTime_day'
+    hour_col = 'IMUTime_hour' if prefix == 'IMU' else 'UTCTime_hour'
+    min_col = 'IMUTime_min' if prefix == 'IMU' else 'UTCTime_min'
+    sec_col = 'IMUTime_sec' if prefix == 'IMU' else 'UTCTime_sec'
+    return (
+        f'{prefix}_Time_Year', f'{prefix}_Time_Month', day_col,
+        hour_col, min_col, sec_col, f'{prefix}_Time_Milsec',
+    )
+
+
+def parse_calibration_timestamps(df, prefix='IMU'):
+    """
+    从年月日时分秒+毫秒列生成绝对时间戳（秒）。
+    已有 Time_s 则原样返回；无效年份行记为 NaN。
+    """
+    if 'Time_s' in df.columns:
+        return df.copy()
+
+    ycol, mcol, dcol, hcol, micol, scol, mscol = _time_prefix_cols(prefix)
+    if ycol not in df.columns:
+        raise KeyError(f"缺少时间列 {ycol}，无法解析 {prefix} 时间戳")
+
+    years = df[ycol].astype(float).values
+    valid = years >= VALID_CALIB_YEAR
+    abs_t = np.full(len(df), np.nan, dtype=np.float64)
+
+    if valid.any():
+        sub = df.loc[valid]
+        dt = pd.to_datetime({
+            'year':   sub[ycol].astype(int),
+            'month':  sub[mcol].astype(int),
+            'day':    sub[dcol].astype(int),
+            'hour':   sub[hcol].astype(int),
+            'minute': sub[micol].astype(int),
+            'second': sub[scol].astype(int),
+        }, utc=True)
+        ms = sub[mscol].astype(float).values / 1000.0
+        abs_t[valid] = dt.astype(np.int64).values / 1e9 + ms
+
+    out = df.copy()
+    out['Time_s'] = abs_t
+    return out
+
+
+def align_calibration_sensor_times(imu_df, gps_df, spd_df):
+    """
+    三传感器行对齐后的统一时间轴（与旧版 Time_s 语义一致：相对首帧秒）。
+
+    - IMU 为主时钟；GNSS 用 UTC 列，无效时回退 IMU 同行时间
+    - 轮速常见 year=0 但车速有效：用 IMU 同行时间
+    - 去掉 IMU 仍无有效时间的占位行（如前 370 行 year=2000）
+    """
+    imu = parse_calibration_timestamps(imu_df, 'IMU')
+    gps = parse_calibration_timestamps(gps_df, 'UTC')
+    spd = parse_calibration_timestamps(spd_df, 'IMU')
+
+    if len(imu) != len(gps) or len(imu) != len(spd):
+        raise ValueError(
+            f"三文件行数不一致: IMU={len(imu)} GNSS={len(gps)} SPD={len(spd)}")
+
+    imu_t = imu['Time_s'].values.astype(np.float64)
+    for df in (gps, spd):
+        t = df['Time_s'].values.astype(np.float64)
+        miss = np.isnan(t)
+        t[miss] = imu_t[miss]
+        df['Time_s'] = t
+
+    ok = ~np.isnan(imu_t)
+    if ok.sum() < 2:
+        raise ValueError("IMU 无有效时间戳，请检查年月日列")
+
+    imu = imu.loc[ok].reset_index(drop=True)
+    gps = gps.loc[ok].reset_index(drop=True)
+    spd = spd.loc[ok].reset_index(drop=True)
+
+    t0 = float(imu['Time_s'].iloc[0])
+    t_master = make_time_monotonic(imu['Time_s'].values - t0)
+    for df in (imu, gps, spd):
+        df['Time_s'] = t_master.copy()
+
+    return imu, gps, spd
+
+
+def read_calibration_triplet(imu_f, spd_f, gps_f):
+    """读取并对齐标定三文件，返回带相对 Time_s 的 (imu, gps, spd)。"""
+    return align_calibration_sensor_times(
+        read_calibration_tab(imu_f),
+        read_calibration_tab(gps_f),
+        read_calibration_tab(spd_f),
+    )
+
+
+def resample_calibration_triplet(imu, gps, spd):
+    """
+    将行对齐的三传感器序列下采样到 TARGET_FREQ 网格。
+    一律以 IMU 单调时间为主轴（GNSS UTC 在 100Hz 上大量重复，不可作 abscissa）。
+    """
+    t_src = imu['Time_s'].values.astype(np.float64)
+    t_s, t_e = float(t_src[0]), float(t_src[-1])
+    t_grid = np.arange(t_s, t_e + TARGET_DT * 0.5, TARGET_DT)
+
+    def interp_col(src_v):
+        return interp1d(
+            t_src, src_v, kind='linear',
+            bounds_error=False, fill_value='extrapolate',
+        )(t_grid)
+
+    rec = {'Time_s': t_grid}
+    for col in ['AccX_g', 'AccY_g', 'AccZ_g', 'GyroX_degs', 'GyroY_degs', 'GyroZ_degs']:
+        rec[col] = interp_col(imu[col].values)
+    rec['VehicleSpeed_kmh'] = interp_col(spd['VehicleSpeed_kmh'].values)
+
+    lat_raw = interp_col(gps['Latitude_deg'].values)
+    lon_raw = interp_col(gps['Longitude_deg'].values)
+    alt_raw = interp_col(gps['Height_m'].values)
+
+    coord_ok = (lat_raw > 1.0) & (lon_raw > 1.0)
+    lat_c, lon_c, alt_c, gps_ok = clean_gps_outliers(t_grid, lat_raw, lon_raw, alt_raw)
+    gps_ok = gps_ok & coord_ok
+    rec['Latitude_deg'] = lat_c
+    rec['Longitude_deg'] = lon_c
+    rec['Height_m'] = alt_c
+
+    return rec, gps_ok, t_grid
+
+
 def split_df_by_time(df, test_ratio=TRAIN_TEST_RATIO):
     """按时间前 (1-ratio) 训练、后 ratio 测试，避免随机窗泄漏。"""
     t0, t1 = float(df['Time_s'].iloc[0]), float(df['Time_s'].iloc[-1])
@@ -257,39 +405,11 @@ def load_calibration_dataset(data_dir, dataset_ids=None):
             print(f"  [SKIP] {ds_id} 不存在")
             continue
         try:
-            def read_tab(p):
-                df = pd.read_csv(p, sep='\t', skipinitialspace=True, encoding='utf-8-sig')
-                df.columns = [c.replace('ï»¿','').strip() for c in df.columns]
-                return df
-
-            imu  = read_tab(imu_f)
-            spd  = read_tab(spd_f)
-            gps  = read_tab(gps_f)
-
-            # 统一时间范围
-            t_s = max(imu['Time_s'].min(), spd['Time_s'].min(), gps['Time_s'].min())
-            t_e = min(imu['Time_s'].max(), spd['Time_s'].max(), gps['Time_s'].max())
-            t_grid = np.arange(t_s, t_e, TARGET_DT)
-
-            def interp_col(src_t, src_v, tg):
-                return interp1d(src_t, src_v, kind='linear',
-                                bounds_error=False, fill_value='extrapolate')(tg)
-
-            rec = {'Time_s': t_grid}
-            for col in ['AccX_g','AccY_g','AccZ_g','GyroX_degs','GyroY_degs','GyroZ_degs']:
-                rec[col] = interp_col(imu['Time_s'].values, imu[col].values, t_grid)
-            rec['VehicleSpeed_kmh'] = interp_col(
-                spd['Time_s'].values, spd['VehicleSpeed_kmh'].values, t_grid)
-
-            lat_raw = interp_col(gps['Time_s'].values, gps['Latitude_deg'].values,  t_grid)
-            lon_raw = interp_col(gps['Time_s'].values, gps['Longitude_deg'].values, t_grid)
-            alt_raw = interp_col(gps['Time_s'].values, gps['Height_m'].values,      t_grid)
-
-            # GPS 跳点清洗
-            lat_c, lon_c, alt_c, gps_ok = clean_gps_outliers(t_grid, lat_raw, lon_raw, alt_raw)
-            rec['Latitude_deg']  = lat_c
-            rec['Longitude_deg'] = lon_c
-            rec['Height_m']      = alt_c
+            imu, gps, spd = read_calibration_triplet(imu_f, spd_f, gps_f)
+            rec, gps_ok, t_grid = resample_calibration_triplet(imu, gps, spd)
+            lat_c = rec['Latitude_deg']
+            lon_c = rec['Longitude_deg']
+            alt_c = rec['Height_m']
 
             # 标定数据没有 HeadingRaw，从 GPS 位移推算航向（作为锚定）
             enu_x, enu_y = batch_wgs84_to_enu(

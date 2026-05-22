@@ -84,7 +84,7 @@ def compute_residual_labels(seq, norm_stats, weights_path):
     gy = seq['enu_y']
 
     # 模拟无 outage（用全量 GPS 让 EKF 得到最优状态）
-    enu_x, enu_y, ekf_h, net_bias, ekf_vx, ekf_vy, ekf_bg = nav.run(
+    enu_x, enu_y, ekf_h, net_bias, ekf_vx, ekf_vy, ekf_bg, _, _ = nav.run(
         imu_raw=seq['imu'],
         v_ms=seq['v_ms'],
         gyro_z_rad=seq['gyro_z_rad'],

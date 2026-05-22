@@ -2,9 +2,6 @@
 validate_ekf.py — EKF 导航器验证脚本
 =====================================
 
-使用 260316_Data.csv 的保留测试段（t >= 620 s）评估：
-  1. 纯死推算（无任何校正）
-  2. BiasNet + EKF 校正
 
 评估指标：
   - 相对位置误差（RPE）：每 30 s 的漂移
@@ -239,8 +236,9 @@ def simulate_gps_loss(seq, loss_duration_s=GPS_LOSS_SIM_SECS, loss_start_s=None)
 
     gps_v, i0, i1 = simulate_gnss_outage(
         pos_ok, tg, loss_start_s, loss_start_s + loss_duration_s)
-    print(f"  [模拟 GNSS outage] 索引 {i0}–{i1}，"
-          f"持续 {tg[min(i1, len(tg)-1)] - tg[i0]:.1f} s")
+    i_end = min(i1, len(tg)) - 1
+    dur = float(tg[i_end] - tg[i0]) if i_end >= i0 else 0.0
+    print(f"  [模拟 GNSS outage] 索引 {i0}–{i1}，持续 {dur:.1f} s")
     return gps_v, i0, i1
 
 
@@ -335,6 +333,8 @@ def _align_origin(truth_x, truth_y, pred_x, pred_y, ref_idx):
 def plot_results(seq, dr_x, dr_y, dr_h,
                  ekf_x, ekf_y, ekf_h, net_bias, ekf_bg,
                  ekf_vx, ekf_vy,
+                 ekf_bg_vec=None, ekf_ba_vec=None,
+                 ekf_vel_scale=None,
                  loss_start_idx=None, loss_end_idx=None,
                  metrics_dr=None, metrics_ekf=None,
                  tag=''):
@@ -415,12 +415,13 @@ def plot_results(seq, dr_x, dr_y, dr_h,
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.35)
 
-    # (d) 零偏预测
+    # (d) 零偏预测（6 通道 — 显示 gyro_z）
     ax = axes[1, 1]
-    ax.plot(t_rel, net_bias * RAD2DEG, 'b-', lw=1.2, label='BiasNet 预测')
+    # net_bias 是 (T, 6)，取 gyro_z 通道 (index 5) 并转 rad/s
+    nb_z_rad = net_bias[:, 5] * DEG2RAD if net_bias.ndim == 2 else net_bias * RAD2DEG
+    ax.plot(t_rel, nb_z_rad * RAD2DEG, 'b-', lw=1.2, label='BiasNet 预测')
     ax.plot(t_rel, ekf_bg * RAD2DEG, 'r-', lw=0.8, alpha=0.7, label='EKF 残差估计')
-    # 合成总零偏 = BiasNet 预测 + EKF 残差
-    total_bias = net_bias * RAD2DEG + ekf_bg * RAD2DEG
+    total_bias = nb_z_rad * RAD2DEG + ekf_bg * RAD2DEG
     ax.plot(t_rel, total_bias, 'g-', lw=0.6, alpha=0.5, label='合计零偏')
     ax.axhline(0, color='k', ls='--', lw=0.4)
     if loss_start_idx is not None:
@@ -428,11 +429,11 @@ def plot_results(seq, dr_x, dr_y, dr_h,
                    alpha=0.08, color='orange')
     ax.set_xlabel('时间 (s)')
     ax.set_ylabel('零偏 (°/s)')
-    ax.set_title('陀螺零偏：BiasNet 预测 vs EKF 残差')
+    ax.set_title('陀螺Z零偏：BiasNet 预测 vs EKF 残差')
     ax.legend(fontsize=8, loc='upper left')
     ax.grid(True, alpha=0.35)
     stats_text = (
-        f"BiasNet: μ={np.mean(net_bias*RAD2DEG):.3f} σ={np.std(net_bias*RAD2DEG):.3f}\n"
+        f"BiasNet: μ={np.mean(nb_z_rad*RAD2DEG):.3f} σ={np.std(nb_z_rad*RAD2DEG):.3f}\n"
         f"EKF bg:  μ={np.mean(ekf_bg*RAD2DEG):.4f} σ={np.std(ekf_bg*RAD2DEG):.4f}\n"
         f"合计:    μ={np.mean(total_bias):.3f} σ={np.std(total_bias):.3f}"
     )
@@ -592,7 +593,8 @@ def main():
 
     gx = seq['enu_x_truth']
     gy = seq['enu_y_truth']
-    ekf_x, ekf_y, ekf_h, net_bias, ekf_vx, ekf_vy, ekf_bg = nav.run(
+    (ekf_x, ekf_y, ekf_h, net_bias, ekf_vx, ekf_vy, ekf_bgz,
+     ekf_bg_vec, ekf_ba_vec, ekf_vel_scale) = nav.run(
         imu_raw=seq_sim['imu_raw'],
         v_ms=seq_sim['v_ms'],
         gyro_z_rad=seq_sim['gyro_z_rad'],
@@ -603,6 +605,10 @@ def main():
         time_s=seq['Time_s'],
         gps_theta=seq_sim['gps_theta'],
     )
+
+    # 向后兼容：net_bias_z 和 ekf_bg 使用 gyro_z 通道
+    net_bias_z = net_bias[:, 5] * DEG2RAD            # deg/s → rad/s
+    ekf_bg = ekf_bgz  # alias for old code
 
     eval_mask = np.isfinite(gx) & np.isfinite(gy)
     # 航向真值：静止时 GPS 航向不可靠（位置位移噪声），仅当运动时参与评估
@@ -618,10 +624,16 @@ def main():
     plot_results(
         seq, dr_x, dr_y, dr_h, ekf_x, ekf_y, ekf_h, net_bias, ekf_bg,
         ekf_vx, ekf_vy,
+        ekf_bg_vec=ekf_bg_vec, ekf_ba_vec=ekf_ba_vec,
+        ekf_vel_scale=ekf_vel_scale,
         loss_start_idx=loss_start, loss_end_idx=loss_end,
         metrics_dr=metrics_dr, metrics_ekf=metrics_ekf,
         tag='figure8',
     )
+    print(f"\n  轮速比例因子 vel_scale: mean={ekf_vel_scale.mean():.4f}  "
+          f"final={ekf_vel_scale[-1]:.4f}  "
+          f"(1.0=无修正, <1.0=轮速偏大)")
+
     print("\n[5] EKF 诊断 ...")
     plot_ekf_diagnostics(
         seq, ekf_vx, ekf_vy, ekf_h, net_bias, loss_start, loss_end, tag='figure8')

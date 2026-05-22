@@ -52,6 +52,7 @@ WINDOW_SIZE     = 30          # 帧 (3 s @ 10 Hz)
 TARGET_DT       = 0.1         # s
 DEG2RAD         = np.pi / 180.0
 RAD2DEG         = 180.0 / np.pi
+GRAVITY         = 9.80665           # m/s² per g
 EARTH_A         = 6378137.0
 EARTH_E2        = 0.00669437999014132
 MIN_SPEED_MS    = 0.5
@@ -59,9 +60,9 @@ GPS_MAX_KMH     = 150.0
 VEH_SPD_FACTOR  = 260.63
 
 BATCH_SIZE      = 256
-EPOCHS          = 80
-LR              = 3e-4
-PATIENCE        = 15
+EPOCHS          = 100
+LR              = 1e-4
+PATIENCE        = 40
 WINDOW_S_INTEG  = 3.0         # 积分法零偏窗口（秒），替代原 BIAS_SMOOTH_W
 
 
@@ -262,64 +263,86 @@ def load_real_seq(csv_path, t_max=None):
 # ============================================================================
 
 def compute_bias_labels(seq, window_s=3.0):
+    """向后兼容：返回 (T,) gyro_z 零偏 [rad/s]"""
+    labels_6d, _ = compute_all_bias_labels(seq, window_s)
+    return labels_6d[:, 5] * DEG2RAD, np.zeros(len(seq['Time_s']), dtype=bool)
+
+
+def compute_all_bias_labels(seq, window_s=3.0):
     """
-    用积分法计算零偏，配合速度 + 直行硬约束剔除噪声标签。
-
-    约束条件（三个掩码取 &）:
-      1. gps_valid  — GPS 信号有效（来自原始配置）
-      2. is_moving  — 轮速 > MIN_SPEED_MS（静止时 GPS 航向无规律跳变）
-      3. is_straight — |陀螺 Z| < 8 °/s（放宽阈值以包含转弯数据，避免 BiasNet 未见转弯）
-
-    仅当窗口两端同时满足上述约束时，才用 3 秒积分窗计算零偏：
-      bias = (Σ(gyro_z)*dt - Δθ_gps) / (N*dt)
-
-    无效段通过线性插值填补，保证输出序列完整。
-    返回 (T,) [rad/s] 及可信掩码 label_ok。
+    计算全部 6 维 IMU 零偏标签。
+    通道: [0]ba_x[g] [1]ba_y[g] [2]ba_z[g] [3]bg_x[deg/s] [4]bg_y[deg/s] [5]bg_z[deg/s]
+    返回 (T, 6), (T,) label_ok
     """
     T = len(seq['Time_s'])
     dt = float(np.median(np.diff(seq['Time_s'])))
     N = max(1, int(window_s / dt))
 
-    gyro_z = seq['gyro_z_rad']                     # (T,) [rad/s]
-    gps_th = seq['gps_theta']                      # (T,) [rad]
-    gps_ok = seq['gps_valid']                      # (T,) bool — GPS 信号有效
-    v_ms   = seq['v_ms']                           # (T,) [m/s]
+    imu = seq['imu']                     # (T, 7)
+    gyro_z_deg = imu[:, 5]              # deg/s
+    gyro_z_rad = gyro_z_deg * DEG2RAD
+    gps_th = seq['gps_theta']
+    gps_ok = seq['gps_valid']
+    v_ms = seq['v_ms']
 
-    # ---- 三合一严格掩码 ----
-    is_moving   = v_ms >= MIN_SPEED_MS                              # > 0.5 m/s
-    is_straight = np.abs(gyro_z) < 8.0 * DEG2RAD                    # |ω| < 8 °/s（放宽→包含转弯）
-    strict_ok   = gps_ok & is_moving & is_straight                   # 严格有效帧
+    is_moving = v_ms >= MIN_SPEED_MS
+    is_straight = np.abs(gyro_z_deg) < 8.0
+    is_very_straight = np.abs(gyro_z_deg) < 2.0
+    is_still = v_ms < 0.1
 
-    # ---- 滑动窗口积分计算零偏 ----
-    bias_labels = np.zeros(T, dtype=np.float32)
-    gyro_cum = np.cumsum(gyro_z) * dt
+    # 轮速导数（ba_x 用）
+    dv_wheel = np.zeros(T, dtype=np.float32)
+    if T > 1:
+        v_smooth = median_filter(v_ms, size=5)
+        dv_wheel[1:] = np.diff(v_smooth) / max(dt, 0.01)
+    dv_wheel_s = median_filter(dv_wheel, size=5)
+
+    labels = np.zeros((T, 6), dtype=np.float32)
+    per_ch_ok = [np.zeros(T, dtype=bool) for _ in range(6)]
+
+    # ---- [5] bg_z: 积分法 ----
+    strict_z = gps_ok & is_moving & is_straight
+    gyro_cum = np.cumsum(gyro_z_rad) * dt
     for i in range(N, T):
-        if strict_ok[i] and strict_ok[i - N]:        # 窗口两端均满足严格条件
-            dth_gps = gps_th[i] - gps_th[i - N]
-            dth_gps = np.arctan2(np.sin(dth_gps), np.cos(dth_gps))  # wrap
-            dth_gyro = gyro_cum[i] - gyro_cum[i - N]
-            bias_labels[i] = (dth_gyro - dth_gps) / (N * dt)
+        if strict_z[i] and strict_z[i - N]:
+            dth = np.arctan2(np.sin(gps_th[i] - gps_th[i - N]),
+                             np.cos(gps_th[i] - gps_th[i - N]))
+            labels[i, 5] = (gyro_cum[i] - gyro_cum[i - N] - dth) / (N * dt) * RAD2DEG
+            per_ch_ok[5][i] = True
 
-    # ---- 有效标签掩码（与 bias_labels 对齐：前 N 帧无标签）----
-    label_ok = np.zeros(T, dtype=bool)
-    if N < T:
-        label_ok[N:] = strict_ok[N:] & strict_ok[:-N]
+    # ---- [0] ba_x: 轮速导数 vs 前向加速度计 ----
+    ok_ax = is_moving & (np.abs(dv_wheel_s) < 3.0)
+    labels[ok_ax, 0] = imu[ok_ax, 0] - dv_wheel_s[ok_ax] / GRAVITY
+    per_ch_ok[0] = ok_ax
 
-    # ---- 后处理 ----
-    n_valid = label_ok.sum()
-    if n_valid < 2:
-        # 有效点太少无法做 median_filter + interp，直接返回 0
-        return bias_labels.astype(np.float32), label_ok
+    # ---- [1] ba_y: NHC 假设 ----
+    ok_ay = is_moving & is_very_straight
+    labels[ok_ay, 1] = imu[ok_ay, 1]
+    per_ch_ok[1] = ok_ay
 
-    # 中值平滑（仅有效段，size 自适应防越界）
-    smooth_size = min(11, max(3, n_valid // 20))
-    bias_labels[label_ok] = median_filter(bias_labels[label_ok], size=smooth_size)
+    # ---- [2] ba_z: 平地假设（静止时 ≈ 1g）----
+    ok_az = is_still
+    labels[ok_az, 2] = imu[ok_az, 2] - 1.0
+    per_ch_ok[2] = ok_az
 
-    # 线性插值填补无效段（保证输出连续）
-    idx = np.arange(T)
-    bias_labels[:] = np.interp(idx, idx[label_ok], bias_labels[label_ok])
+    # ---- [3,4] bg_x, bg_y: 静止段均值 ----
+    ok_bgxy = is_still
+    labels[ok_bgxy, 3] = imu[ok_bgxy, 3]
+    labels[ok_bgxy, 4] = imu[ok_bgxy, 4]
+    per_ch_ok[3] = ok_bgxy
+    per_ch_ok[4] = ok_bgxy
 
-    return bias_labels.astype(np.float32), label_ok
+    # ---- 后处理：中值平滑 + 插值 ----
+    for c in range(6):
+        ch_ok = per_ch_ok[c]
+        nv = ch_ok.sum()
+        if nv >= 10:
+            ss = min(11, max(3, nv // 20))
+            labels[ch_ok, c] = median_filter(labels[ch_ok, c], size=ss)
+            idx = np.arange(T)
+            labels[:, c] = np.interp(idx, idx[ch_ok], labels[ch_ok, c])
+
+    return labels.astype(np.float32), per_ch_ok[5]
 
 
 # ============================================================================
@@ -361,18 +384,27 @@ def normalize_imu(imu, mu, std):
 # 构造训练样本
 # ============================================================================
 
+def weighted_huber_loss(y_true, y_pred):
+    """6 通道加权 Huber loss。权重: ba_x/y=0.5, ba_z=0.1, bg_x/y=0.1, bg_z=1.0"""
+    weights = tf.constant([0.5, 0.5, 0.1, 0.1, 0.1, 1.0], dtype=tf.float32)
+    delta = 1.0
+    error = y_true - y_pred
+    abs_error = tf.abs(error)
+    quadratic = 0.5 * tf.square(error)
+    linear = delta * (abs_error - 0.5 * delta)
+    per_ch = tf.where(abs_error <= delta, quadratic, linear)
+    return tf.reduce_mean(per_ch * weights)
+
+
 def build_samples(seqs, mu, std, window_size=WINDOW_SIZE, tunnel_aug=True):
     """
-    返回 X (N, W, 6) 和 Y (N, 1) [rad/s]
-
-    当 tunnel_aug=True 时，对每段数据模拟一段 GPS 丢失，生成额外的训练窗口，
-    让 BiasNet 学会在 GPS 丢失场景下的零偏预测。
+    返回 X (N, W, 7) 和 Y (N, 6) [ba_x,ba_y,ba_z(g), bg_x,bg_y,bg_z(deg/s)]
     """
     X_list, Y_list = [], []
 
     def _windows_from_seq(seq, label=''):
         imu_norm = normalize_imu(seq['imu'], mu, std)      # (T, 7)
-        bias, _ = compute_bias_labels(seq)                   # (T,) [rad/s]
+        bias, _ = compute_all_bias_labels(seq)              # (T, 6)
         T = len(imu_norm)
         if T < window_size:
             return
@@ -382,33 +414,28 @@ def build_samples(seqs, mu, std, window_size=WINDOW_SIZE, tunnel_aug=True):
 
     for seq in seqs:
         _windows_from_seq(seq)
-
-        # ---- 隧道增强：模拟一段 GPS 丢失 ----
         if tunnel_aug:
             import copy
             seq_aug = copy.deepcopy(seq)
             T = len(seq_aug['Time_s'])
-            # 在中间段找一段运动平稳的区域模拟掉 GPS
             motion = np.where(seq_aug['v_ms'] >= MIN_SPEED_MS)[0]
             if len(motion) < 100:
                 continue
             mid = len(motion) // 2
             center = motion[mid]
-            half = 40  # 模拟 4 秒掉 GPS（前后留缓冲）
+            half = 40
             out_start = max(0, center - half)
             out_end = min(T, center + half)
             if out_end - out_start < 30:
                 continue
-            # 把这一段标记为 GPS 无效 → compute_bias_labels 会插值填补偏标签
             seq_aug['gps_valid'][out_start:out_end] = False
             _windows_from_seq(seq_aug, label='tunnel')
 
     if not X_list:
         return np.empty((0, window_size, 7), dtype=np.float32), \
-               np.empty((0, 1), dtype=np.float32)
-
+               np.empty((0, 6), dtype=np.float32)
     X = np.stack(X_list, axis=0).astype(np.float32)
-    Y = np.array(Y_list, np.float32).reshape(-1, 1)
+    Y = np.stack(Y_list, axis=0).astype(np.float32)
     return X, Y
 
 
@@ -418,10 +445,10 @@ def build_samples(seqs, mu, std, window_size=WINDOW_SIZE, tunnel_aug=True):
 
 def main():
     print("=" * 60)
-    print("BiasNet 训练：陀螺 Z 轴零偏预测")
+    print("BiasNet 训练：6 维 IMU 零偏预测")
     print("=" * 60)
 
-    # 1. 加载数据：训练集训练 BiasNet，Data05 作 fit 验证
+    # 1. 加载数据
     print(f"\n[1] 加载数据 ({', '.join(CALIB_TRAIN_IDS)} 训练 / "
           f"{CALIB_VAL_ID} 验证) ...")
     seqs_tr = load_calibration_seq(DATA_DIR_CALIB, CALIB_TRAIN_IDS)
@@ -430,7 +457,7 @@ def main():
         raise RuntimeError(
             f"未找到训练集 {CALIB_TRAIN_IDS}，请先运行 data_preprocessing_v2.py")
 
-    # 2. 归一化统计量
+    # 2. 归一化
     print("\n[2] 准备归一化参数 ...")
     mu, std, stats = load_or_compute_norm(seqs_tr, NORM_JSON)
 
@@ -438,6 +465,7 @@ def main():
     print("\n[3] 构造训练样本 ...")
     X_tr, Y_tr = build_samples(seqs_tr, mu, std, tunnel_aug=True)
     print(f"  训练样本 + 隧道增强 ({len(CALIB_TRAIN_IDS)} 段): {len(X_tr)}")
+    print(f"  X_tr: {X_tr.shape}, Y_tr: {Y_tr.shape}")
     if seqs_val:
         X_val, Y_val = build_samples(seqs_val, mu, std, tunnel_aug=False)
         print(f"  {CALIB_VAL_ID} 验证样本: {len(X_val)}")
@@ -446,16 +474,16 @@ def main():
         n_val = max(1, int(0.15 * len(X_tr)))
         X_val, Y_val = X_tr[idx[:n_val]], Y_tr[idx[:n_val]]
         X_tr, Y_tr = X_tr[idx[n_val:]], Y_tr[idx[n_val:]]
-    print(f"  零偏标签  均值={Y_tr.mean()*RAD2DEG:.4f} deg/s  "
-          f"std={Y_tr.std()*RAD2DEG:.4f} deg/s")
+
+    ch_names = ['ba_x[g]', 'ba_y[g]', 'ba_z[g]', 'bg_x[d/s]', 'bg_y[d/s]', 'bg_z[d/s]']
+    for c, name in enumerate(ch_names):
+        print(f"  {name}: mean={Y_tr[:, c].mean():.5f}  std={Y_tr[:, c].std():.5f}")
 
     # 4. 构建模型
-    print("\n[4] 构建 BiasNet ...")
+    print("\n[4] 构建 BiasNet (6 维输出) ...")
     model = BiasNet(window_size=WINDOW_SIZE)
     optimizer = tf.keras.optimizers.Adam(learning_rate=LR)
-    model.compile(optimizer=optimizer, loss='huber',
-                  metrics=['mae'])
-    # 预跑一次以初始化权重
+    model.compile(optimizer=optimizer, loss=weighted_huber_loss, metrics=['mae'])
     model(X_tr[:1])
     model.summary()
 
@@ -464,45 +492,43 @@ def main():
     callbacks = [
         ModelCheckpoint(str(WEIGHTS_PATH), save_weights_only=True,
                         monitor='val_loss', save_best_only=True, verbose=1),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=8,
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=15,
                           min_lr=1e-6, verbose=1),
         EarlyStopping(monitor='val_loss', patience=PATIENCE,
                       restore_best_weights=True, verbose=1),
     ]
-
     history = model.fit(
         X_tr, Y_tr,
         validation_data=(X_val, Y_val),
-        batch_size=BATCH_SIZE,
-        epochs=EPOCHS,
-        callbacks=callbacks,
-        verbose=2,
+        batch_size=BATCH_SIZE, epochs=EPOCHS,
+        callbacks=callbacks, verbose=2,
     )
 
     # 6. 保存信息
     final_val_mae = min(history.history['val_mae'])
-    print(f"\n最优验证 MAE: {final_val_mae*RAD2DEG:.5f} deg/s")
-
+    print(f"\n最优验证 MAE: {final_val_mae:.5f}")
     info = {
         'window_size': WINDOW_SIZE,
-        'target_dt'  : TARGET_DT,
-        'norm_stats' : stats,
+        'target_dt': TARGET_DT,
+        'output_dim': 6,
+        'output_channels': ch_names,
+        'norm_stats': stats,
         'train_samples': int(len(X_tr)),
-        'val_samples'  : int(len(X_val)),
-        'best_val_mae_rads': float(final_val_mae),
-        'best_val_mae_degs': float(final_val_mae * RAD2DEG),
+        'val_samples': int(len(X_val)),
+        'best_val_mae': float(final_val_mae),
     }
     with open(MODEL_DIR / 'biasnet_info.json', 'w') as f:
         json.dump(info, f, indent=2)
 
-    # 7. 快速检验：在验证集上预测
+    # 7. 快速检验
     print("\n[6] 验证集快速检验 ...")
-    Y_pred = model(X_val, training=False).numpy().flatten()
-    Y_true = Y_val.flatten()
-    residual = (Y_pred - Y_true) * RAD2DEG
-    print(f"  预测误差  mean={residual.mean():.5f} deg/s  "
-          f"std={residual.std():.5f} deg/s  "
-          f"p95={np.percentile(np.abs(residual), 95):.5f} deg/s")
+    Y_pred = model(X_val, training=False).numpy()          # (N, 6)
+    Y_true = Y_val
+    residual = Y_pred - Y_true                              # (N, 6)
+    for c, name in enumerate(ch_names):
+        rc = residual[:, c]
+        print(f"  {name}: err_mean={rc.mean():+.5f}  err_std={rc.std():.5f}  "
+              f"err_p95={np.percentile(np.abs(rc), 95):.5f}")
     print(f"\n权重已保存到：{WEIGHTS_PATH}")
     print("下一步：运行 validate_ekf.py 查看轨迹效果")
 
@@ -511,7 +537,7 @@ def main():
 
 
 def save_training_log(info, history, residual, config_params):
-    """生成带时间戳的训练日志。"""
+    """生成带时间戳的训练日志（6 通道）。"""
     from datetime import datetime
     log_dir = Path(__file__).parent / "training_logs"
     log_dir.mkdir(exist_ok=True)
@@ -519,17 +545,13 @@ def save_training_log(info, history, residual, config_params):
     log = {
         'timestamp': timestamp,
         'config': {
-            'q_yaw': config_params.q_yaw,
-            'q_vel': config_params.q_vel,
-            'q_bg': config_params.q_bg,
-            'q_pos': config_params.q_pos,
-            'r_gps_xy': config_params.r_gps_xy,
-            'r_wheel': config_params.r_wheel,
-            'r_nhc': config_params.r_nhc,
-            'nhc_yaw_rate_thresh': config_params.nhc_yaw_rate_thresh,
-            'nhc_r_scale_turn': config_params.nhc_r_scale_turn,
+            'q_yaw': config_params.q_yaw, 'q_vel': config_params.q_vel,
+            'q_bg': config_params.q_bg, 'q_bg_xy': config_params.q_bg_xy,
+            'q_ba': config_params.q_ba, 'q_pos': config_params.q_pos,
+            'r_gps_xy': config_params.r_gps_xy, 'r_wheel': config_params.r_wheel,
+            'r_nhc': config_params.r_nhc, 'r_accel': config_params.r_accel,
             'biasnet_max_deg': config_params.biasnet_max_deg,
-            'freeze_yaw_below_ms': config_params.freeze_yaw_below_ms,
+            'biasnet_max_acc_g': config_params.biasnet_max_acc_g,
         },
         'training': {
             'train_samples': info['train_samples'],
@@ -537,42 +559,36 @@ def save_training_log(info, history, residual, config_params):
             'epochs_completed': len(history.history['loss']),
             'best_epoch': int(np.argmin(history.history['val_loss'])) + 1,
             'best_val_loss': float(min(history.history['val_loss'])),
-            'best_val_mae_rads': info['best_val_mae_rads'],
-            'best_val_mae_degs': info['best_val_mae_degs'],
+            'best_val_mae': info['best_val_mae'],
         },
-        'prediction': {
-            'residual_mean_degs': float(residual.mean()),
-            'residual_std_degs': float(residual.std()),
-            'residual_p95_degs': float(np.percentile(np.abs(residual), 95)),
-        },
+        'prediction_per_channel': {},
     }
+    ch_names = ['ba_x_g', 'ba_y_g', 'ba_z_g', 'bg_x_degs', 'bg_y_degs', 'bg_z_degs']
+    for c, name in enumerate(ch_names):
+        rc = residual[:, c]
+        log['prediction_per_channel'][name] = {
+            'err_mean': float(rc.mean()), 'err_std': float(rc.std()),
+            'err_p95': float(np.percentile(np.abs(rc), 95)),
+        }
     log_path = log_dir / f"train_{timestamp}.json"
     with open(log_path, 'w', encoding='utf-8') as f:
         json.dump(log, f, indent=2, ensure_ascii=False)
     print(f"\n[日志] 已保存到 {log_path}")
 
-    # ---- 追加汇总到 SUMMARY_TRAIN.md ----
     summary_path = log_dir / "SUMMARY_TRAIN.md"
     if not summary_path.exists():
         with open(summary_path, 'w', encoding='utf-8') as f:
             f.write("# 训练记录汇总\n\n")
-            f.write("| 时间 | 样本数 | Epochs | Best val MAE(°/s) |"
-                    " 残差mean(°/s) | 残差std(°/s) | 残差p95(°/s) |\n")
-            f.write("|------|--------|--------|--------------------|"
-                    "------------------|-----------------|----------------|\n")
-
+            f.write("| 时间 | 样本数 | Epochs | Best val MAE | bg_z std(d/s) | ba_x std(g) |\n")
+            f.write("|------|--------|--------|--------------|---------------|-------------|\n")
     tr = log['training']
-    pr = log['prediction']
+    pr = log['prediction_per_channel']
     dt_str = datetime.now().strftime("%m-%d %H:%M")
-    line = (
-        f"| {dt_str} "
-        f"| {tr['train_samples']} "
-        f"| {tr['epochs_completed']}/{tr.get('best_epoch', '—')} "
-        f"| {tr['best_val_mae_degs']:.4f} "
-        f"| {pr['residual_mean_degs']:+.4f} "
-        f"| {pr['residual_std_degs']:.4f} "
-        f"| {pr['residual_p95_degs']:.4f} |\n"
-    )
+    line = (f"| {dt_str} | {tr['train_samples']} "
+            f"| {tr['epochs_completed']}/{tr.get('best_epoch', '—')} "
+            f"| {tr['best_val_mae']:.5f} "
+            f"| {pr['bg_z_degs']['err_std']:.5f} "
+            f"| {pr['ba_x_g']['err_std']:.5f} |\n")
     with open(summary_path, 'a', encoding='utf-8') as f:
         f.write(line)
     print(f"[汇总] 已追加到 {summary_path}")

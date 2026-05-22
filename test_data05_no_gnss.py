@@ -198,7 +198,8 @@ def plot_no_gps(seq, dr_x, dr_y, ekf_x, ekf_y, ekf_h, net_bias, metrics_dr, metr
     ax.grid(True, alpha=0.35)
 
     ax = axes[1, 1]
-    ax.plot(t_rel, net_bias * RAD2DEG, 'g-', lw=0.9, label='BiasNet')
+    nb_z = net_bias[:, 5] * DEG2RAD if net_bias.ndim == 2 else net_bias * RAD2DEG
+    ax.plot(t_rel, nb_z * RAD2DEG, 'g-', lw=0.9, label='BiasNet')
     ax.plot(t_rel, ekf_h * RAD2DEG, 'b-', lw=0.8, alpha=0.7, label='EKF 航向')
     ax.set_xlabel('时间 (s)')
     ax.set_ylabel('°/s 或 °')
@@ -249,7 +250,7 @@ def main():
         window_size=WINDOW_SIZE,
         ekf_config=DEFAULT_EKF_CONFIG,
     )
-    ekf_x, ekf_y, ekf_h, net_bias, _, _, _ = nav.run(
+    ekf_x, ekf_y, ekf_h, net_bias, _, _, _, _, _ = nav.run(
         imu_raw=seq['imu_raw'],
         v_ms=seq['v_ms'],
         gyro_z_rad=seq['gyro_z_rad'],
