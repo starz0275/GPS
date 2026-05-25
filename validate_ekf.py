@@ -232,7 +232,7 @@ def simulate_gps_loss(seq, loss_duration_s=GPS_LOSS_SIM_SECS, loss_start_s=None)
             print(f"  [自动] 首次运动在 {float(tg[motion_idx[0]] - tg[0]):.1f}s，"
                   f"outage 从 {loss_start_s:.1f}s 开始")
         else:
-            loss_start_s = 15.0
+            loss_start_s = 20.0
 
     gps_v, i0, i1 = simulate_gnss_outage(
         pos_ok, tg, loss_start_s, loss_start_s + loss_duration_s)
@@ -566,9 +566,39 @@ def main():
 
     # 2. 模拟 GNSS outage（对准 8 字路段 100s-200s）
     print("\n[1] 设置 GNSS outage 模拟（覆盖八字路段）...")
-    gps_v_sim, loss_start, loss_end = simulate_gps_loss(seq, loss_duration_s=100.0, loss_start_s=100.0)
+    gps_v_sim, loss_start, loss_end = simulate_gps_loss(seq, loss_duration_s=120.0, loss_start_s=120.0)
     seq_sim = dict(seq)
     seq_sim['gps_valid'] = gps_v_sim
+
+    # ---- 全局轮速比例修正：GPS速度/轮速 中值 ----
+    gx_full = seq['enu_x_truth']
+    gy_full = seq['enu_y_truth']
+    gps_ok_full = seq['gps_valid_full'] if 'gps_valid_full' in seq else seq['gps_valid']
+    vw_raw = seq_sim['v_ms']
+    T = len(vw_raw)
+
+    # 用全量 GPS（outage 前）计算 GPS 速度
+    gps_spd = np.zeros(T, dtype=np.float32)
+    dt_gps = np.clip(np.diff(seq['Time_s'], prepend=seq['Time_s'][0]), 0.05, 0.5)
+    for i in range(1, T):
+        if gps_ok_full[i] and gps_ok_full[i - 1]:
+            dx = float(gx_full[i] - gx_full[i - 1])
+            dy = float(gy_full[i] - gy_full[i - 1])
+            gps_spd[i] = np.sqrt(dx * dx + dy * dy) / dt_gps[i]
+
+    # 取 GPS 速度和轮速都足够大的帧，计算全局中值比例
+    mask = gps_ok_full & (vw_raw > 1.0) & (gps_spd > 1.0)
+    if mask.sum() > 50:
+        ratios = gps_spd[mask] / vw_raw[mask]
+        scale = float(np.median(ratios))
+        scale = np.clip(scale, 0.85, 1.15)  # 防异常
+    else:
+        scale = 1.0
+
+    seq_sim['v_ms'] = vw_raw * scale
+    print(f"  [轮速修正] GPS/轮速 全局中值 = {scale:.4f}  "
+          f"(均值 {seq['v_ms'].mean():.2f} → {seq_sim['v_ms'].mean():.2f} m/s)")
+    # ----------------------------------------------------------------
 
     outage_mask = np.zeros(len(seq['Time_s']), dtype=bool)
     outage_mask[loss_start:loss_end] = True
