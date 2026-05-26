@@ -1,0 +1,40 @@
+{
+  "timestamp": "20260525_154631",
+  "config": {
+    "q_yaw": 2e-05,
+    "q_vel": 0.0009,
+    "q_bg": 1e-08,
+    "q_pos": 1e-06,
+    "r_gps_xy": 4.0,
+    "r_wheel": 0.0144,
+    "r_nhc": 0.0036,
+    "nhc_yaw_rate_thresh": 0.15,
+    "nhc_r_scale_turn": 5.0,
+    "biasnet_max_deg": 2.0,
+    "freeze_yaw_below_ms": 0.5
+  },
+  "simulation": {
+    "outage_duration_s": 119.00000762939453,
+    "outage_start_idx": 1016,
+    "outage_end_idx": 2206
+  },
+  "dr_metrics": {
+    "rmse_m": 12.138104438781738,
+    "median_m": 0.0,
+    "final_m": 0.0,
+    "max_m": 32.897666931152344,
+    "heading_rmse_deg": 22.967801762021402
+  },
+  "ekf_metrics": {
+    "rmse_m": 5.207859039306641,
+    "median_m": 1.8454195261001587,
+    "final_m": 8.97496223449707,
+    "max_m": 19.062469482421875,
+    "heading_rmse_deg": 14.646595871663056,
+    "heading_rmse_no_outage_deg": 2.1735704668037004,
+    "heading_rmse_outage_deg": 18.819575653898966,
+    "outage_max_m": 19.062469482421875,
+    "outage_median_m": 5.199064254760742,
+    "outage_final_m": 19.062469482421875
+  }
+}

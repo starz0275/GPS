@@ -11,12 +11,18 @@ class EKFConfig:
 
     # ---- 过程噪声（每步）----
     q_yaw: float = 2e-5              # 航向传播 rad²/step
-    q_vel: float = 0.03 ** 2         # ENU 速度随机游走 (m/s)²/step（0.03→outage下漂移更慢）
-    q_bg: float = 1e-8               # 残余陀螺Z零偏随机游走 (rad/s)²/step（小值防 outage 下漂移）
+    q_vel: float = 0.03 ** 2         # ENU 速度随机游走 (m/s)²/step
+    q_bg: float = 1e-8               # 残余陀螺Z零偏随机游走 (rad/s)²/step
     q_bg_xy: float = 1e-10           # 陀螺X/Y零偏随机游走 (rad/s)²/step（2D 非关键轴）
     q_ba: float = 1e-6               # 加速度计零偏随机游走 (m/s²)²/step
     q_pos: float = 1e-6              # 位置附加（通常由 vx,vy 传播主导）
     q_vel_scale: float = 1e-6        # 轮速比例因子随机游走（允许缓慢收敛）
+
+    # ---- 转弯自适应 Q（|yaw_rate| 越大，Q 越大）----
+    turn_q_scale_yaw: float = 1.0    # 转弯时 q_yaw 最大放大倍数（1.0=关闭）
+    turn_q_scale_vel: float = 1.0    # 转弯时 q_vel 最大放大倍数
+    turn_q_scale_bg: float = 1.0     # 转弯时 q_bg 最大放大倍数
+    turn_yaw_rate_max: float = 0.8   # 达到最大缩放对应的 yaw_rate (rad/s)
 
     # ---- 量测噪声 ----
     r_gps_xy: float = 2.0 ** 2       # GNSS 平面位置 (m)² / 轴
@@ -25,8 +31,8 @@ class EKFConfig:
     r_accel: float = 0.3 ** 2        # 加速度计前向伪量测 (m/s²)²（用于轮速导数约束 ba_x）
 
     # ---- 动态 NHC（转弯削弱约束）----
-    nhc_yaw_rate_thresh: float = 0.12   # rad/s
-    nhc_r_scale_turn: float = 50.0
+    nhc_yaw_rate_thresh: float = 0.15   # rad/s (~8.6°/s，更高门槛才触发转弯)
+    nhc_r_scale_turn: float = 5.0    # 转弯时 NHC R 放大倍数（原50→5，保留约束）
 
     # ---- BiasNet 推理限幅 ----
     biasnet_max_deg: float = 2.0     # |gyro_bias| <= 2 deg/s via tanh

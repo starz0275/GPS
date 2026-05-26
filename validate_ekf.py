@@ -2,14 +2,19 @@
 validate_ekf.py — EKF 导航器验证脚本
 =====================================
 
+用法:
+  python validate_ekf.py                                    # 默认 Data05，自动 outage
+  python validate_ekf.py --data Data07                       # 指定数据集
+  python validate_ekf.py --l1 120 60 --l2 200 60             # 丢1:120s起持续60s, 丢2:200s起持续60s
+  python validate_ekf.py --data Data04 --l1 80 40 --l2 0 0  # 一段outage(丢2时长=0则跳过)
 
 评估指标：
-  - 相对位置误差（RPE）：每 30 s 的漂移
-  - 累积位置误差随时间曲线
-  - 轨迹对比图（GPS 真值 vs 纯 DR vs EKF）
-  - 航向对比图（GPS 真值 vs 陀螺积分 vs EKF）
+  - 分阶段位置误差（GNSS正常→丢1→恢复→丢2→恢复）
+  - 轨迹对比图（GPS 真值 vs EKF 预测）
+  - 航向对比图（GPS 真值 vs EKF）
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -212,7 +217,7 @@ def load_test_segment():
     }
 
 
-GPS_LOSS_SIM_SECS = 90.0    # 模拟 GNSS outage 时长（秒）
+GPS_LOSS_SIM_SECS = 60.0    # 模拟 GNSS outage 时长（秒）
 
 
 def simulate_gps_loss(seq, loss_duration_s=GPS_LOSS_SIM_SECS, loss_start_s=None):
@@ -335,13 +340,12 @@ def plot_results(seq, dr_x, dr_y, dr_h,
                  ekf_vx, ekf_vy,
                  ekf_bg_vec=None, ekf_ba_vec=None,
                  ekf_vel_scale=None,
-                 loss_start_idx=None, loss_end_idx=None,
+                 outage_segments=None,  # [(start1,end1), (start2,end2), ...]
                  metrics_dr=None, metrics_ekf=None,
                  tag=''):
     from datetime import datetime
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag_str = f"_{tag}" if tag else ""
-    out_name = f"ekf_validation_{timestamp}{tag_str}.png"
     tg = seq['Time_s']
     truth_x = seq['enu_x_truth']
     truth_y = seq['enu_y_truth']
@@ -357,95 +361,130 @@ def plot_results(seq, dr_x, dr_y, dr_h,
     ekf_err = np.sqrt((ex[idx_v] - tx[idx_v]) ** 2 + (ey[idx_v] - ty[idx_v]) ** 2)
 
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle(f'GNSS/INS/Wheel 6-State EKF 验证 ({timestamp})', fontsize=14, fontweight='bold')
+    # 标记 outage 区域 — 直接从参数传入
+    outage_masks = outage_segments if outage_segments else []
+    T_plot = len(t_rel)
+    # ======================================================================
+    # Figure 1：轨迹对比（大地图，重点突出两条预测线）
+    # ======================================================================
+    fig1, ax1 = plt.subplots(1, 1, figsize=(14, 14))
+    fig1.suptitle(f'EKF 轨迹验证 ({timestamp})', fontsize=14, fontweight='bold')
 
-    # (a) 轨迹 — 等比例，限制显示范围防炸裂
-    ax = axes[0, 0]
-    ax.plot(tx[idx_v], ty[idx_v], 'g-', lw=2.0, label='GNSS 真值', zorder=5)
-    ax.plot(drx, dry, 'r--', lw=1.0, alpha=0.75, label='DR（纯陀螺+轮速）')
-    ax.plot(ex, ey, 'b-', lw=1.4, alpha=0.9, label='BiasNet + 6-State EKF')
-    if loss_start_idx is not None and loss_end_idx is not None:
-        sl = slice(loss_start_idx, loss_end_idx)
-        ax.plot(ex[sl], ey[sl], color='darkorange', lw=2.2, label='GNSS outage 段')
-        ax.axvspan(ex[loss_start_idx], ex[min(loss_end_idx, len(ex) - 1)],
-                   alpha=0.12, color='orange')
-        ax.plot(ex[loss_start_idx], ey[loss_start_idx], 'go', ms=8)
-        ax.plot(ex[loss_end_idx - 1], ey[loss_end_idx - 1], 'r^', ms=8)
-    pad = 30.0
-    all_x = np.concatenate([tx[idx_v], drx[idx_v], ex[idx_v]])
-    all_y = np.concatenate([ty[idx_v], dry[idx_v], ey[idx_v]])
+    # GNSS 真值 — 灰色细线作参考
+    ax1.plot(tx[idx_v], ty[idx_v], color='gray', lw=1.0, alpha=0.6, label='GNSS 真值', zorder=2)
+
+    # EKF — 蓝色实线，加粗（全段）
+    ax1.plot(ex, ey, 'b-', lw=2.2, alpha=0.95, label='EKF 预测轨迹', zorder=4)
+
+    # Outage 段高亮 — 鲜绿粗线 + 起止标记
+    for oi, (os_i, oe_i) in enumerate(outage_masks):
+        oe_i = min(oe_i, T_plot - 1)
+        # EKF outage 段 — 鲜绿粗线
+        ax1.plot(ex[os_i:oe_i+1], ey[os_i:oe_i+1], color='#00cc00', lw=6.0, alpha=0.9,
+                 label=f'GNSS 丢失段{oi+1} ({tg[os_i]:.0f}–{tg[oe_i]:.0f}s)', zorder=7)
+        # 起点 — 大绿圆，终点 — 大红三角
+        ax1.scatter([ex[os_i]], [ey[os_i]], c='#00ff00', s=200, marker='o',
+                    edgecolors='black', linewidths=1.5, zorder=10)
+        ax1.scatter([ex[oe_i]], [ey[oe_i]], c='red', s=250, marker='^',
+                    edgecolors='black', linewidths=1.5, zorder=10)
+        # 文字标注
+        ax1.annotate(f'丢{oi+1} 起点\n{tg[os_i]:.0f}s', (ex[os_i], ey[os_i]),
+                     xytext=(15, 20), textcoords='offset points',
+                     fontsize=10, color='#00aa00', fontweight='bold',
+                     arrowprops=dict(arrowstyle='->', color='green', lw=2))
+        ax1.annotate(f'丢{oi+1} 终点\n{tg[oe_i]:.0f}s', (ex[oe_i], ey[oe_i]),
+                     xytext=(15, -25), textcoords='offset points',
+                     fontsize=10, color='red', fontweight='bold',
+                     arrowprops=dict(arrowstyle='->', color='red', lw=2))
+
+    # 自适应视野
+    pad = 25.0
+    all_x = np.concatenate([tx[idx_v], ex[idx_v]])
+    all_y = np.concatenate([ty[idx_v], ey[idx_v]])
     cx, cy = np.median(all_x), np.median(all_y)
     half = max(np.percentile(np.abs(all_x - cx), 98),
                np.percentile(np.abs(all_y - cy), 98), pad)
-    ax.set_xlim(cx - half, cx + half)
-    ax.set_ylim(cy - half, cy + half)
-    ax.set_xlabel('East (m)')
-    ax.set_ylabel('North (m)')
-    ax.set_title('轨迹对比（原点对齐首帧 GNSS）')
-    ax.legend(fontsize=8, loc='best')
-    ax.grid(True, alpha=0.35)
-    ax.set_aspect('equal', adjustable='box')
+    ax1.set_xlim(cx - half, cx + half)
+    ax1.set_ylim(cy - half, cy + half)
+    ax1.set_xlabel('East (m)', fontsize=12)
+    ax1.set_ylabel('North (m)', fontsize=12)
+    ax1.set_title('EKF 预测轨迹 — 灰色=GNSS真值  蓝色=EKF  绿色粗线=丢失段 ●起点 ▲终点', fontsize=12)
+    ax1.legend(fontsize=10, loc='best', framealpha=0.9)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_aspect('equal', adjustable='box')
+    plt.tight_layout()
+    out_path1 = OUTPUT_DIR / f"ekf_trajectory_{timestamp}{tag_str}.png"
+    fig1.savefig(out_path1, dpi=150, bbox_inches='tight')
+    plt.close(fig1)
+    print(f"[轨迹图] {out_path1}")
 
-    # (b) 位置误差
-    ax = axes[0, 1]
-    ax.plot(t_rel[idx_v], dr_err, 'r-', lw=1.2, label='DR')
-    ax.plot(t_rel[idx_v], ekf_err, 'b-', lw=1.2, label='EKF')
-    if loss_start_idx is not None:
-        ax.axvspan(t_rel[loss_start_idx], t_rel[min(loss_end_idx, len(t_rel) - 1)],
-                   alpha=0.12, color='orange', label='Outage')
-    ax.set_xlabel('时间 (s)')
+    # ======================================================================
+    # Figure 2：时序诊断（误差 / 航向 / 零偏）
+    # ======================================================================
+    fig2, axes2 = plt.subplots(3, 1, figsize=(16, 13), sharex=True)
+    fig2.suptitle(f'EKF 时序诊断 ({timestamp})', fontsize=14, fontweight='bold')
+
+    # (a) 位置误差
+    ax = axes2[0]
+    ax.plot(t_rel[idx_v], dr_err, 'r-', lw=1.2, label='DR 位置误差')
+    ax.plot(t_rel[idx_v], ekf_err, 'b-', lw=1.5, label='EKF 位置误差')
+    for oi, (os_i, oe_i) in enumerate(outage_masks):
+        oe_i = min(oe_i, T_plot - 1)
+        ax.axvspan(t_rel[os_i], t_rel[oe_i], alpha=0.12, color='lime',
+                   label=f'Outage {oi+1}')
     ax.set_ylabel('位置误差 (m)')
-    ax.set_title('相对 GNSS 位置误差')
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=9, loc='upper left', ncol=4)
     ax.grid(True, alpha=0.35)
+    # 统计标注
+    ax.text(0.02, 0.95,
+            f"DR  RMSE={np.sqrt(np.mean(dr_err**2)):.1f}m  "
+            f"max={np.max(dr_err):.1f}m\n"
+            f"EKF RMSE={np.sqrt(np.mean(ekf_err**2)):.1f}m  "
+            f"max={np.max(ekf_err):.1f}m",
+            transform=ax.transAxes, fontsize=8.5, va='top',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
 
-    # (c) 航向（静止段隐藏，仅显示运动时的航向）
-    ax = axes[1, 0]
+    # (b) 航向
+    ax = axes2[1]
     moving = seq['v_ms'] >= 0.5
     gps_head = np.where(eval_mask & moving, seq['gps_theta'] * RAD2DEG, np.nan)
     dr_h_plot = np.where(moving, dr_h * RAD2DEG, np.nan)
     ekf_h_plot = np.where(moving, ekf_h * RAD2DEG, np.nan)
-    ax.plot(t_rel, gps_head, 'g-', lw=1.2, alpha=0.8, label='GNSS 航向')
-    ax.plot(t_rel, dr_h_plot, 'r--', lw=1.0, alpha=0.7, label='DR')
-    ax.plot(t_rel, ekf_h_plot, 'b-', lw=1.2, label='EKF')
-    ax.set_xlabel('时间 (s)')
+    ax.plot(t_rel, gps_head, 'k-', lw=0.8, alpha=0.5, label='GNSS 航向')
+    ax.plot(t_rel, dr_h_plot, 'r--', lw=1.0, alpha=0.7, label='DR 航向')
+    ax.plot(t_rel, ekf_h_plot, 'b-', lw=1.5, label='EKF 航向')
+    for oi, (os_i, oe_i) in enumerate(outage_masks):
+        oe_i = min(oe_i, T_plot - 1)
+        ax.axvspan(t_rel[os_i], t_rel[oe_i], alpha=0.12, color='lime')
     ax.set_ylabel('航向 (°)')
-    ax.set_title('航向对比')
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=9, loc='upper left', ncol=3)
     ax.grid(True, alpha=0.35)
 
-    # (d) 零偏预测（6 通道 — 显示 gyro_z）
-    ax = axes[1, 1]
-    # net_bias 是 (T, 6)，取 gyro_z 通道 (index 5) 并转 rad/s
+    # (c) 零偏
+    ax = axes2[2]
     nb_z_rad = net_bias[:, 5] * DEG2RAD if net_bias.ndim == 2 else net_bias * RAD2DEG
     ax.plot(t_rel, nb_z_rad * RAD2DEG, 'b-', lw=1.2, label='BiasNet 预测')
-    ax.plot(t_rel, ekf_bg * RAD2DEG, 'r-', lw=0.8, alpha=0.7, label='EKF 残差估计')
-    total_bias = nb_z_rad * RAD2DEG + ekf_bg * RAD2DEG
-    ax.plot(t_rel, total_bias, 'g-', lw=0.6, alpha=0.5, label='合计零偏')
+    ax.plot(t_rel, ekf_bg * RAD2DEG, 'r-', lw=0.8, alpha=0.7, label='EKF 残差')
+    ax.plot(t_rel, nb_z_rad * RAD2DEG + ekf_bg * RAD2DEG, 'g-', lw=0.6, label='合计零偏')
     ax.axhline(0, color='k', ls='--', lw=0.4)
-    if loss_start_idx is not None:
-        ax.axvspan(t_rel[loss_start_idx], t_rel[min(loss_end_idx, len(t_rel) - 1)],
-                   alpha=0.08, color='orange')
+    for oi, (os_i, oe_i) in enumerate(outage_masks):
+        oe_i = min(oe_i, T_plot - 1)
+        ax.axvspan(t_rel[os_i], t_rel[oe_i], alpha=0.12, color='lime')
     ax.set_xlabel('时间 (s)')
     ax.set_ylabel('零偏 (°/s)')
-    ax.set_title('陀螺Z零偏：BiasNet 预测 vs EKF 残差')
-    ax.legend(fontsize=8, loc='upper left')
+    ax.legend(fontsize=9, loc='upper left', ncol=3)
     ax.grid(True, alpha=0.35)
-    stats_text = (
-        f"BiasNet: μ={np.mean(nb_z_rad*RAD2DEG):.3f} σ={np.std(nb_z_rad*RAD2DEG):.3f}\n"
-        f"EKF bg:  μ={np.mean(ekf_bg*RAD2DEG):.4f} σ={np.std(ekf_bg*RAD2DEG):.4f}\n"
-        f"合计:    μ={np.mean(total_bias):.3f} σ={np.std(total_bias):.3f}"
-    )
-    ax.text(0.98, 0.97, stats_text, transform=ax.transAxes, fontsize=7.5,
-            verticalalignment='top', horizontalalignment='right',
+    ax.text(0.98, 0.97,
+            f"BiasNet μ={np.mean(nb_z_rad*RAD2DEG):.3f} σ={np.std(nb_z_rad*RAD2DEG):.3f}°/s\n"
+            f"EKF bg  μ={np.mean(ekf_bg*RAD2DEG):.4f} σ={np.std(ekf_bg*RAD2DEG):.4f}°/s",
+            transform=ax.transAxes, fontsize=7.5, va='top', ha='right',
             bbox=dict(boxstyle='round,pad=0.4', facecolor='wheat', alpha=0.7))
 
     plt.tight_layout()
-    out_path = OUTPUT_DIR / out_name
-    plt.savefig(out_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"\n[图像] 已保存到 {out_path}")
+    out_path2 = OUTPUT_DIR / f"ekf_diagnosis_{timestamp}{tag_str}.png"
+    fig2.savefig(out_path2, dpi=150, bbox_inches='tight')
+    plt.close(fig2)
+    print(f"[诊断图] {out_path2}")
 
     print("\n" + "=" * 60)
     print("评估指标（相对 GNSS 真值）")
@@ -549,59 +588,116 @@ def plot_ekf_diagnostics(seq, vel_x, vel_y, headings, net_bias, loss_start, loss
 # ============================================================================
 
 def main():
-    print("=" * 55)
-    print("EKF 导航器验证（默认 Data02 标定验证集）")
-    print("=" * 55)
+    parser = argparse.ArgumentParser(description='EKF 导航器验证')
+    parser.add_argument('--data', type=str, default=None,
+                        help='数据集ID (如 Data05, Data07)，默认使用 VAL_DATASET_ID')
+    parser.add_argument('--l1', nargs=2, type=float, default=None,
+                        metavar=('START_S', 'DUR_S'),
+                        help='第一段 outage：起始时间(s) 和 持续时长(s)')
+    parser.add_argument('--l2', nargs=2, type=float, default=None,
+                        metavar=('START_S', 'DUR_S'),
+                        help='第二段 outage：起始时间(s) 和 持续时长(s)，dur=0 则跳过')
+    args = parser.parse_args()
 
     # 1. 加载测试数据
+    dataset_id = args.data
+    if dataset_id is None:
+        try:
+            from trajectory_data import VAL_DATASET_ID
+            dataset_id = VAL_DATASET_ID
+        except Exception:
+            dataset_id = 'Data05'
+    print("=" * 55)
+    print(f"EKF 导航器验证 — 数据集: {dataset_id}")
+    print("=" * 55)
+
     try:
-        from trajectory_data import load_calibration_segment, VAL_DATASET_ID
-        print(f"[数据] 加载标定验证集 {VAL_DATASET_ID} ...")
-        seq = _seq_from_calibration(load_calibration_segment(VAL_DATASET_ID))
+        from trajectory_data import load_calibration_segment
+        print(f"[数据] 加载标定验证集 {dataset_id} ...")
+        seq = _seq_from_calibration(load_calibration_segment(dataset_id))
     except Exception:
         seq = load_test_segment()
 
     if 'gps_valid_full' not in seq:
         seq['gps_valid_full'] = seq['gps_valid'].copy()
 
-    # 2. 模拟 GNSS outage（对准 8 字路段 100s-200s）
-    print("\n[1] 设置 GNSS outage 模拟（覆盖八字路段）...")
-    gps_v_sim, loss_start, loss_end = simulate_gps_loss(seq, loss_duration_s=120.0, loss_start_s=120.0)
+    # ENU 坐标归零：以首个 GPS 有效帧（非插值）为原点
+    gps_ok = seq['gps_valid_full'] if 'gps_valid_full' in seq else seq['gps_valid']
+    ok_init = gps_ok & np.isfinite(seq['enu_x_truth']) & np.isfinite(seq['enu_y_truth'])
+    if ok_init.any():
+        i0 = int(np.where(ok_init)[0][0])
+        x0, y0 = float(seq['enu_x_truth'][i0]), float(seq['enu_y_truth'][i0])
+        seq['enu_x_truth'] = seq['enu_x_truth'].copy() - x0
+        seq['enu_y_truth'] = seq['enu_y_truth'].copy() - y0
+        # 首个有效GPS之前的插值填充帧标记为无效（坐标无意义）
+        seq['gps_valid_full'][:i0] = False
+
+    # 2. 模拟两段 GNSS outage（真实场景：GNSS正常→丢失1→恢复→丢失2→恢复）
+    tg = seq['Time_s']
+    T = len(tg)
+    # 用全量 GPS 构建初始 gps_valid
+    gps_ok_full = seq['gps_valid_full'] if 'gps_valid_full' in seq else seq['gps_valid']
+    gps_v_full = gps_ok_full & np.isfinite(seq['enu_x_truth']) & np.isfinite(seq['enu_y_truth'])
+
+    # 两段 outage — 命令行指定 或 自动适配
+    total_dur = float(tg[-1] - tg[0])
+    if args.l1 is not None:
+        loss1_start_s, loss1_dur_s = args.l1[0], args.l1[1]
+    else:
+        # 自动：确保丢1前EKF已充分收敛
+        loss1_start_s = max(100.0, total_dur * 0.45)
+        loss1_dur_s   = min(60.0, (total_dur - loss1_start_s) * 0.40)
+    if args.l2 is not None:
+        loss2_start_s, loss2_dur_s = args.l2[0], args.l2[1]
+    else:
+        loss2_start_s = loss1_start_s + loss1_dur_s + max(20.0, total_dur * 0.08)
+        loss2_start_s = min(loss2_start_s, total_dur - 20.0)
+        loss2_dur_s   = min(60.0, total_dur - loss2_start_s - 5.0)
+
+    print(f"\n[1] GNSS outage 配置:")
+    gps_v_sim = gps_v_full.copy()
+    outage_segs = []
+    for name, start_s, dur_s in [("丢失1", loss1_start_s, loss1_dur_s),
+                                   ("丢失2", loss2_start_s, loss2_dur_s)]:
+        if dur_s <= 0:
+            print(f"  {name}: 跳过（时长={dur_s:.0f}s）")
+            continue
+        gps_v_sim, i0, i1 = simulate_gnss_outage(gps_v_sim, tg, start_s, start_s + dur_s)
+        i1 = min(i1, T - 1)
+        print(f"  {name}: {tg[i0]:.0f}s–{tg[i1]:.0f}s ({tg[i1]-tg[i0]:.1f}s)"
+              f"  索引 {i0}–{i1}")
+        outage_segs.append((i0, i1))
+
     seq_sim = dict(seq)
     seq_sim['gps_valid'] = gps_v_sim
 
-    # ---- 全局轮速比例修正：GPS速度/轮速 中值 ----
+    # ---- 全局轮速比例修正 ----
     gx_full = seq['enu_x_truth']
     gy_full = seq['enu_y_truth']
-    gps_ok_full = seq['gps_valid_full'] if 'gps_valid_full' in seq else seq['gps_valid']
     vw_raw = seq_sim['v_ms']
-    T = len(vw_raw)
 
-    # 用全量 GPS（outage 前）计算 GPS 速度
     gps_spd = np.zeros(T, dtype=np.float32)
-    dt_gps = np.clip(np.diff(seq['Time_s'], prepend=seq['Time_s'][0]), 0.05, 0.5)
+    dt_gps = np.clip(np.diff(tg, prepend=tg[0]), 0.05, 0.5)
     for i in range(1, T):
         if gps_ok_full[i] and gps_ok_full[i - 1]:
             dx = float(gx_full[i] - gx_full[i - 1])
             dy = float(gy_full[i] - gy_full[i - 1])
             gps_spd[i] = np.sqrt(dx * dx + dy * dy) / dt_gps[i]
 
-    # 取 GPS 速度和轮速都足够大的帧，计算全局中值比例
     mask = gps_ok_full & (vw_raw > 1.0) & (gps_spd > 1.0)
     if mask.sum() > 50:
-        ratios = gps_spd[mask] / vw_raw[mask]
-        scale = float(np.median(ratios))
-        scale = np.clip(scale, 0.85, 1.15)  # 防异常
+        scale = float(np.median(gps_spd[mask] / vw_raw[mask]))
+        scale = np.clip(scale, 0.85, 1.15)
     else:
         scale = 1.0
 
     seq_sim['v_ms'] = vw_raw * scale
     print(f"  [轮速修正] GPS/轮速 全局中值 = {scale:.4f}  "
           f"(均值 {seq['v_ms'].mean():.2f} → {seq_sim['v_ms'].mean():.2f} m/s)")
-    # ----------------------------------------------------------------
 
-    outage_mask = np.zeros(len(seq['Time_s']), dtype=bool)
-    outage_mask[loss_start:loss_end] = True
+    outage_mask = np.zeros(T, dtype=bool)
+    for s, e in outage_segs:
+        outage_mask[s:e] = True
 
     # 3. DR 基准
     print("\n[2] 运行 DR 基准（outage 段无 GNSS 锚定）...")
@@ -640,7 +736,8 @@ def main():
     net_bias_z = net_bias[:, 5] * DEG2RAD            # deg/s → rad/s
     ekf_bg = ekf_bgz  # alias for old code
 
-    eval_mask = np.isfinite(gx) & np.isfinite(gy)
+    eval_mask = (np.isfinite(gx) & np.isfinite(gy)
+                 & seq['gps_valid_full'])  # 排除 GPS 无效的插值帧
     # 航向真值：静止时 GPS 航向不可靠（位置位移噪声），仅当运动时参与评估
     truth_yaw = seq['gps_theta'].copy()
     still = seq['v_ms'] < 0.5
@@ -650,28 +747,53 @@ def main():
     metrics_ekf = evaluate_trajectory(
         ekf_x, ekf_y, ekf_h, gx, gy, truth_yaw, eval_mask, outage_mask)
 
+    # ---- 分阶段指标 ----
+    def _phase_rmse(px, py, phase_mask):
+        idx = np.where(eval_mask & phase_mask)[0]
+        if len(idx) == 0:
+            return float('nan')
+        err = np.sqrt((px[idx] - gx[idx]) ** 2 + (py[idx] - gy[idx]) ** 2)
+        return float(np.sqrt(np.mean(err ** 2)))
+
+    # 构建阶段 mask
+    phase_masks = []
+    prev_end = 0
+    for si, (s, e) in enumerate(outage_segs):
+        if s > prev_end:
+            phase_masks.append((f'GNSS段{si+1}', slice(prev_end, s)))
+        phase_masks.append((f'丢失{si+1}', slice(s, e)))
+        prev_end = e
+    if prev_end < T:
+        phase_masks.append((f'GNSS段{len(outage_segs)+1}', slice(prev_end, T)))
+
+    print(f"\n[3.5] 分阶段评估 ({len(outage_segs)}段outage)")
+    for name, px, py in [('DR', dr_x, dr_y), ('EKF', ekf_x, ekf_y)]:
+        parts = []
+        for label, sl in phase_masks:
+            pm = np.zeros(T, dtype=bool); pm[sl] = True
+            r = _phase_rmse(px, py, pm)
+            parts.append(f'{label}={r:.1f}m')
+        print(f"  [{name}] {' | '.join(parts)}")
+    # ----------------------------------------------------------------
+
     print("\n[4] 绘制结果 ...")
     plot_results(
         seq, dr_x, dr_y, dr_h, ekf_x, ekf_y, ekf_h, net_bias, ekf_bg,
         ekf_vx, ekf_vy,
         ekf_bg_vec=ekf_bg_vec, ekf_ba_vec=ekf_ba_vec,
         ekf_vel_scale=ekf_vel_scale,
-        loss_start_idx=loss_start, loss_end_idx=loss_end,
+        outage_segments=outage_segs,
         metrics_dr=metrics_dr, metrics_ekf=metrics_ekf,
-        tag='figure8',
+        tag=dataset_id,
     )
     print(f"\n  轮速比例因子 vel_scale: mean={ekf_vel_scale.mean():.4f}  "
           f"final={ekf_vel_scale[-1]:.4f}  "
           f"(1.0=无修正, <1.0=轮速偏大)")
 
-    print("\n[5] EKF 诊断 ...")
-    plot_ekf_diagnostics(
-        seq, ekf_vx, ekf_vy, ekf_h, net_bias, loss_start, loss_end, tag='figure8')
-
-    save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, seq['Time_s'])
+    save_validation_log(metrics_dr, metrics_ekf, outage_segs, tg, dataset_id)
 
 
-def save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, tg):
+def save_validation_log(metrics_dr, metrics_ekf, outage_segs, tg, dataset_id=''):
     """生成带时间戳的验证日志，并追加汇总到 SUMMARY.md。"""
     import json
     from datetime import datetime
@@ -681,28 +803,24 @@ def save_validation_log(metrics_dr, metrics_ekf, loss_start, loss_end, tg):
     log_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    outage_duration = float(tg[min(loss_end, len(tg)-1)] - tg[loss_start]) if loss_start is not None else 0.0
+    outage_info = []
+    for i, (s, e) in enumerate(outage_segs):
+        dur = float(tg[min(e, len(tg)-1)] - tg[s]) if s < len(tg) else 0
+        outage_info.append({'seg': i+1, 'start_idx': int(s), 'end_idx': int(min(e, len(tg)-1)),
+                            'start_s': float(tg[s]), 'end_s': float(tg[min(e, len(tg)-1)]),
+                            'duration_s': dur})
 
     log = {
         'timestamp': timestamp,
+        'dataset': dataset_id,
         'config': {
-            'q_yaw': DEFAULT_EKF_CONFIG.q_yaw,
-            'q_vel': DEFAULT_EKF_CONFIG.q_vel,
-            'q_bg': DEFAULT_EKF_CONFIG.q_bg,
-            'q_pos': DEFAULT_EKF_CONFIG.q_pos,
-            'r_gps_xy': DEFAULT_EKF_CONFIG.r_gps_xy,
-            'r_wheel': DEFAULT_EKF_CONFIG.r_wheel,
+            'q_yaw': DEFAULT_EKF_CONFIG.q_yaw, 'q_vel': DEFAULT_EKF_CONFIG.q_vel,
+            'q_bg': DEFAULT_EKF_CONFIG.q_bg, 'q_pos': DEFAULT_EKF_CONFIG.q_pos,
+            'r_gps_xy': DEFAULT_EKF_CONFIG.r_gps_xy, 'r_wheel': DEFAULT_EKF_CONFIG.r_wheel,
             'r_nhc': DEFAULT_EKF_CONFIG.r_nhc,
-            'nhc_yaw_rate_thresh': DEFAULT_EKF_CONFIG.nhc_yaw_rate_thresh,
             'nhc_r_scale_turn': DEFAULT_EKF_CONFIG.nhc_r_scale_turn,
-            'biasnet_max_deg': DEFAULT_EKF_CONFIG.biasnet_max_deg,
-            'freeze_yaw_below_ms': DEFAULT_EKF_CONFIG.freeze_yaw_below_ms,
         },
-        'simulation': {
-            'outage_duration_s': outage_duration,
-            'outage_start_idx': int(loss_start) if loss_start is not None else None,
-            'outage_end_idx': int(loss_end) if loss_end is not None else None,
-        },
+        'outage_segments': outage_info,
         'dr_metrics': {
             'rmse_m': metrics_dr.get('rmse_m', None),
             'median_m': metrics_dr.get('median_m', None),

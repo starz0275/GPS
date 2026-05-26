@@ -1,0 +1,51 @@
+{
+  "timestamp": "20260525_155236",
+  "dataset": "Data05",
+  "config": {
+    "q_yaw": 2e-05,
+    "q_vel": 0.0009,
+    "q_bg": 1e-08,
+    "q_pos": 1e-06,
+    "r_gps_xy": 4.0,
+    "r_wheel": 0.0144,
+    "r_nhc": 0.0036,
+    "nhc_r_scale_turn": 5.0
+  },
+  "outage_segments": [
+    {
+      "seg": 1,
+      "start_idx": 1100,
+      "end_idx": 1600,
+      "start_s": 110.0,
+      "end_s": 160.0,
+      "duration_s": 50.0
+    },
+    {
+      "seg": 2,
+      "start_idx": 1800,
+      "end_idx": 2200,
+      "start_s": 180.0,
+      "end_s": 220.0,
+      "duration_s": 40.0
+    }
+  ],
+  "dr_metrics": {
+    "rmse_m": 4.779420375823975,
+    "median_m": 0.0,
+    "final_m": 0.0,
+    "max_m": 21.71493148803711,
+    "heading_rmse_deg": 20.71162274968609
+  },
+  "ekf_metrics": {
+    "rmse_m": 4.904510498046875,
+    "median_m": 1.8362722396850586,
+    "final_m": 6.596240043640137,
+    "max_m": 14.791402816772461,
+    "heading_rmse_deg": 16.01960502843323,
+    "heading_rmse_no_outage_deg": 2.7818403506022396,
+    "heading_rmse_outage_deg": 21.535059625819617,
+    "outage_max_m": 14.791402816772461,
+    "outage_median_m": 6.140044689178467,
+    "outage_final_m": 14.791402816772461
+  }
+}

@@ -253,100 +253,99 @@ class EKF6D:
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
         self._symmetrize_P()
 
-    # ---- 时间更新（加速度计积分速度）----
+    # ---- 时间更新（轮速驱动前向速度）----
     def predict(self, gyro_meas: np.ndarray, accel_meas: np.ndarray,
                 bias_net: np.ndarray, dt: float,
-                freeze_yaw: bool = False):
+                freeze_yaw: bool = False, v_wheel: float = None):
         """
         gyro_meas  : (3,) 陀螺三轴 [rad/s]
         accel_meas : (3,) 加速度计三轴 [g]
-        bias_net   : (6,) BiasNet 前馈零偏 [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z]
-                     单位: ba [g], bg [deg/s]
-        dt         : 时间步长 (s)
-        freeze_yaw : True 时不积分航向（零速/停车）
+        bias_net   : (6,) BiasNet 前馈零偏 [ba_x,ba_y,ba_z, bg_x,bg_y,bg_z]
+        v_wheel    : 轮速 [m/s]，用于混合前向速度估计
         """
         px, py, vx, vy, yaw = self.x[:5]
         bgx, bgy, bgz = self.x[IDX_BGX], self.x[IDX_BGY], self.x[IDX_BGZ]
         bax, bay, baz = self.x[IDX_BAX], self.x[IDX_BAY], self.x[IDX_BAZ]
         vel_scale = self.x[IDX_VEL_SCALE]
 
-        # 总零偏 = BiasNet 前馈 + EKF 残余估计
-        ba_net = bias_net[0:3].astype(np.float64)                         # [g]
-        bg_net = bias_net[3:6].astype(np.float64) * DEG2RAD               # deg/s → rad/s
-        ba_total = ba_net + np.array([bax, bay, baz])                     # [g]
-        bg_total = bg_net + np.array([bgx, bgy, bgz])                     # [rad/s]
+        ba_net = bias_net[0:3].astype(np.float64)
+        bg_net = bias_net[3:6].astype(np.float64) * DEG2RAD
+        ba_total = ba_net + np.array([bax, bay, baz])
+        bg_total = bg_net + np.array([bgx, bgy, bgz])
 
-        # 1. 航向积分（修正陀螺 Z）
+        # 1. 航向积分
         if freeze_yaw:
             dpsi = 0.0
         else:
             gyro_z_corr = float(gyro_meas[2]) - float(bg_total[2])
             dpsi = gyro_z_corr * dt
         yaw_new = wrap_angle(yaw + dpsi)
-
-        # 2. 加速度计修正 [g] → [m/s²]
-        acc_corr_g = accel_meas.astype(np.float64) - ba_total             # (3,) [g]
-        acc_corr_x = float(acc_corr_g[0]) * GRAVITY                       # forward accel [m/s²]
-
-        # 3. 速度传播（混合模式）
+        c_yaw_new, s_yaw_new = np.cos(yaw_new), np.sin(yaw_new)
         c_yaw, s_yaw = np.cos(yaw), np.sin(yaw)
-        #    协调转弯：旋转已有速度矢量，保持 |v| 不变（鲁棒）
+
+        # 2. 速度传播 — 前向用轮速(80%)混合EKF估计(20%)
         c_dpsi, s_dpsi = np.cos(dpsi), np.sin(dpsi)
         vx_rot = vx * c_dpsi - vy * s_dpsi
         vy_rot = vx * s_dpsi + vy * c_dpsi
 
-        #    前向加速度修正：仅用 bias-corrected 前向加速度改变速率
-        #    （不使用横向加速度，由 NHC 量测约束）
-        #    accel_fusion_gain 控制融合强度（0=纯协调转弯，1=全加速度计积分）
-        alpha = self.cfg.accel_fusion_gain
-        a_fwd_enu_x = alpha * acc_corr_x * c_yaw
-        a_fwd_enu_y = alpha * acc_corr_x * s_yaw
-        vx_new = vx_rot + a_fwd_enu_x * dt
-        vy_new = vy_rot + a_fwd_enu_y * dt
+        # 侧向速度保持 EKF 估计（受 NHC 约束）
+        v_lat_ekf = -vx_rot * s_yaw_new + vy_rot * c_yaw_new
 
-        # 4. 位置积分
-        px_new = px + vx * dt
-        py_new = py + vy * dt
+        if v_wheel is not None and v_wheel > 0.5:
+            v_fwd_ekf = vx_rot * c_yaw_new + vy_rot * s_yaw_new
+            v_fwd_wheel = float(v_wheel) * float(vel_scale)
+            v_fwd = 0.8 * v_fwd_wheel + 0.2 * v_fwd_ekf
+        else:
+            v_fwd = vx_rot * c_yaw_new + vy_rot * s_yaw_new
 
-        # 5. 零偏随机游走
+        vx_new = v_fwd * c_yaw_new - v_lat_ekf * s_yaw_new
+        vy_new = v_fwd * s_yaw_new + v_lat_ekf * c_yaw_new
+
+        # 3. 位置积分
+        px_new = px + v_fwd * c_yaw_new * dt
+        py_new = py + v_fwd * s_yaw_new * dt
+
+        # 4. 零偏随机游走
         self.x = np.array([
             px_new, py_new, vx_new, vy_new, yaw_new,
             bgx, bgy, bgz, bax, bay, baz, vel_scale,
         ], dtype=np.float64)
 
         # ---- 雅可比 F (12×12) ----
-        # 速度模型:
-        #   vx_new = vx*c_dpsi - vy*s_dpsi + acc_corr_x*c_yaw*dt
-        #   vy_new = vx*s_dpsi + vy*c_dpsi + acc_corr_x*s_yaw*dt
-        #   acc_corr_x = (acc_x_meas - ba_total_x) * GRAVITY
         F = np.eye(N_STATE, dtype=np.float64)
-        # 位置 → 速度
-        F[IDX_PX, IDX_VX] = dt
-        F[IDX_PY, IDX_VY] = dt
-        # 速度 → vx, vy（协调转弯旋转）
-        F[IDX_VX, IDX_VX] = c_dpsi
-        F[IDX_VX, IDX_VY] = -s_dpsi
-        F[IDX_VY, IDX_VX] = s_dpsi
-        F[IDX_VY, IDX_VY] = c_dpsi
-        # 速度 → yaw（前向加速度旋转到 ENU，受 alpha 缩放）
-        F[IDX_VX, IDX_YAW] = -alpha * acc_corr_x * s_yaw * dt
-        F[IDX_VY, IDX_YAW] = alpha * acc_corr_x * c_yaw * dt
-        # 速度 → bgz（通过 dpsi 影响速度旋转）
-        F[IDX_VX, IDX_BGZ] = (vx * s_dpsi + vy * c_dpsi) * dt
-        F[IDX_VY, IDX_BGZ] = (-vx * c_dpsi + vy * s_dpsi) * dt
-        # 速度 → ba_x（前向加速度零偏，受 alpha 缩放）
-        F[IDX_VX, IDX_BAX] = -alpha * c_yaw * GRAVITY * dt
-        F[IDX_VY, IDX_BAX] = -alpha * s_yaw * GRAVITY * dt
+        # 位置 → vx,vy（车体前向速度投影）
+        F[IDX_PX, IDX_VX] = c_yaw * c_yaw_new * dt * 0.2
+        F[IDX_PX, IDX_VY] = s_yaw * c_yaw_new * dt * 0.2
+        F[IDX_PY, IDX_VX] = c_yaw * s_yaw_new * dt * 0.2
+        F[IDX_PY, IDX_VY] = s_yaw * s_yaw_new * dt * 0.2
+        # 速度 → vx,vy
+        F[IDX_VX, IDX_VX] = 0.2 * (c_dpsi * c_yaw_new - (-s_dpsi) * s_yaw_new)
+        F[IDX_VX, IDX_VY] = 0.2 * (-s_dpsi * c_yaw_new - c_dpsi * s_yaw_new)
+        F[IDX_VY, IDX_VX] = 0.2 * (c_dpsi * s_yaw_new + (-s_dpsi) * c_yaw_new)
+        F[IDX_VY, IDX_VY] = 0.2 * (-s_dpsi * s_yaw_new + c_dpsi * c_yaw_new)
+        # 位置 → yaw
+        F[IDX_PX, IDX_YAW] = -v_fwd * s_yaw_new * dt
+        F[IDX_PY, IDX_YAW] = v_fwd * c_yaw_new * dt
+        # 位置 → vel_scale（前向速度来源）
+        if v_wheel is not None and v_wheel > 0.5:
+            F[IDX_PX, IDX_VEL_SCALE] = 0.8 * float(v_wheel) * c_yaw_new * dt
+            F[IDX_PY, IDX_VEL_SCALE] = 0.8 * float(v_wheel) * s_yaw_new * dt
         # 航向 → bgz
         if not freeze_yaw:
             F[IDX_YAW, IDX_BGZ] = -dt
 
         c_cfg = self.cfg
+        # 转弯自适应 Q：|yaw_rate| 越大，Q 越大（让滤波器在弯道更保守）
+        yr = abs(float(gyro_meas[2]) - float(bg_total[2]))  # 修正后偏航率
+        turn_factor = min(yr / c_cfg.turn_yaw_rate_max, 1.0)
+        q_yaw_t = c_cfg.q_yaw * (1.0 + (c_cfg.turn_q_scale_yaw - 1.0) * turn_factor)
+        q_vel_t = c_cfg.q_vel * (1.0 + (c_cfg.turn_q_scale_vel - 1.0) * turn_factor)
+        q_bg_t  = c_cfg.q_bg  * (1.0 + (c_cfg.turn_q_scale_bg  - 1.0) * turn_factor)
         Q = np.diag([
             c_cfg.q_pos, c_cfg.q_pos,
-            c_cfg.q_vel, c_cfg.q_vel,
-            c_cfg.q_yaw,
-            c_cfg.q_bg_xy, c_cfg.q_bg_xy, c_cfg.q_bg,
+            q_vel_t, q_vel_t,
+            q_yaw_t,
+            c_cfg.q_bg_xy, c_cfg.q_bg_xy, q_bg_t,
             c_cfg.q_ba, c_cfg.q_ba, c_cfg.q_ba,
             c_cfg.q_vel_scale,
         ])
@@ -459,6 +458,41 @@ class EKF6D:
         H[0, IDX_VX] = -sn
         H[0, IDX_VY] = cs
         H[0, IDX_YAW] = -vx * cs - vy * sn
+        self._joseph_update(H, innov, R)
+
+    # ---- 转弯航向伪量测：a_lat ≈ v_fwd * yaw_rate ----
+    def update_turn_heading(self, gyro_z_meas: float, acc_y_g: float,
+                            ba_total_y: float, bg_net_z: float,
+                            r_turn: float = None):
+        """
+        转弯运动学约束：侧向加速度应满足 a_lat = v_fwd * ω_z。
+        若实测 a_lat 与预测值不匹配，说明 ω_z（航向变化率）有偏差 → 修正 bgz/航向。
+
+        仅在 |yaw_rate| > 阈值时调用（明显转弯）。
+        """
+        yaw = self.x[IDX_YAW]
+        vx, vy = self.x[IDX_VX], self.x[IDX_VY]
+        bgz = self.x[IDX_BGZ]
+        c, s = np.cos(yaw), np.sin(yaw)
+
+        yaw_rate = float(gyro_z_meas) - bg_net_z - bgz
+        v_fwd = vx * c + vy * s
+
+        # 预测侧向加速度（运动学）
+        a_lat_pred = v_fwd * yaw_rate
+        # 实测侧向加速度（IMU，已修正零偏）
+        a_lat_meas = (float(acc_y_g) - ba_total_y) * GRAVITY
+
+        innov = np.array([a_lat_meas - a_lat_pred])
+        H = np.zeros((1, N_STATE))
+        H[0, IDX_VX] = c * yaw_rate
+        H[0, IDX_VY] = s * yaw_rate
+        H[0, IDX_YAW] = (-vx * s + vy * c) * yaw_rate
+        H[0, IDX_BGZ] = -v_fwd
+        H[0, IDX_BAY] = GRAVITY
+
+        r = r_turn if r_turn is not None else (1.0 ** 2)  # 1.0 m/s² 噪声
+        R = np.array([[r]], dtype=np.float64)
         self._joseph_update(H, innov, R)
 
     # ---- 加速度计前向量测（约束 ba_x）----
@@ -841,10 +875,8 @@ class EKFNavigatorNP:
             vw = float(v_ms[k]) if np.isfinite(v_ms[k]) else 0.0
 
             still = vw < cfg.freeze_yaw_below_ms
-            ekf.predict(gyro_meas, accel_meas, bn, dt_k, freeze_yaw=still)
-            if still:
-                ekf.x[IDX_VX] = 0.0
-                ekf.x[IDX_VY] = 0.0
+            ekf.predict(gyro_meas, accel_meas, bn, dt_k,
+                        freeze_yaw=still, v_wheel=vw)
 
             gps_ok_now = (gps_valid[k] and np.isfinite(gps_enu_x[k])
                           and np.isfinite(gps_enu_y[k]))
@@ -869,6 +901,16 @@ class EKFNavigatorNP:
                 yaw_rate = float(gyro_meas[2]) - gn - float(ekf.x[IDX_BGZ])
                 r_nhc_dyn = float(noise_r[k, 0])
                 ekf.update_nhc(yaw_rate=yaw_rate, r_nhc=r_nhc_dyn)
+
+                # 转弯航向伪量测：a_lat ≈ v_fwd * yaw_rate（仅outage时启用）
+                if (abs(yaw_rate) > 0.15
+                        and not (gps_valid[k] and np.isfinite(gps_enu_x[k])
+                                 and np.isfinite(gps_enu_y[k]))):
+                    ba_net_y = bn[1]
+                    ekf.update_turn_heading(
+                        float(gyro_meas[2]), float(accel_meas[1]),
+                        float(ba_net_y + ekf.x[IDX_BAY]),
+                        gn)
 
             # 加速度计前向约束（用轮速导数约束 ba_x）
             if enable_accel_meas and vw >= cfg.min_speed_wheel_ms:

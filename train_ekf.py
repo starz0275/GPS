@@ -418,20 +418,16 @@ def build_samples(seqs, mu, std, window_size=WINDOW_SIZE, tunnel_aug=True):
     for seq in seqs:
         imu_norm = normalize_imu(seq['imu'], mu, std)
         bias_6d, _ = compute_all_bias_labels(seq)
-        gyro_z_deg = seq['imu'][:, 5]  # 原始陀螺 Z deg/s，用于识别转弯
-        is_turn = np.abs(gyro_z_deg) > 12.0  # |ω| > 12°/s = 转弯
+        gyro_z_deg = seq['imu'][:, 5]
+        is_turn = np.abs(gyro_z_deg) > 12.0
 
         # 原始窗口（全量 GPS）
-        n_orig = len(X_list)
         _windows_from_seq(seq, imu_norm, bias_6d)
         # 转弯窗口额外多采 1 次（共 2x）
         for i in range(len(imu_norm) - window_size + 1):
             if is_turn[i + window_size - 1]:
                 X_list.append(imu_norm[i: i + window_size])
                 Y_list.append(bias_6d[i + window_size - 1])
-        n_turn_orig = len(X_list) - n_orig - (len(imu_norm) - window_size + 1)
-        if n_turn_orig > 0:
-            print(f"  [{seq.get('id','?')}] 全量GPS转弯窗口追加 +{n_turn_orig}")
 
         if not tunnel_aug:
             continue
@@ -467,7 +463,6 @@ def build_samples(seqs, mu, std, window_size=WINDOW_SIZE, tunnel_aug=True):
             for i in range(w_start, w_end + 1):
                 X_list.append(imu_norm[i: i + window_size])
                 Y_list.append(bias_aug[i + window_size - 1])
-                # 转弯窗口多采 1 次（共 2x），重点学习弯道丢失场景
                 if is_turn[i + window_size - 1]:
                     X_list.append(imu_norm[i: i + window_size])
                     Y_list.append(bias_aug[i + window_size - 1])
