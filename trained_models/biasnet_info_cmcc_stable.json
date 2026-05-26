@@ -1,0 +1,60 @@
+{
+  "window_size": 30,
+  "target_dt": 0.1,
+  "output_dim": 6,
+  "output_channels": [
+    "ba_x[g]",
+    "ba_y[g]",
+    "ba_z[g]",
+    "bg_x[d/s]",
+    "bg_y[d/s]",
+    "bg_z[d/s]"
+  ],
+  "norm_stats": {
+    "AccX_g": {
+      "mean": 0.050599925220012665,
+      "std": 0.23002438247203827
+    },
+    "AccY_g": {
+      "mean": 0.05552501976490021,
+      "std": 0.08983633667230606
+    },
+    "AccZ_g": {
+      "mean": 0.9963411688804626,
+      "std": 0.05288269370794296
+    },
+    "GyroX_degs": {
+      "mean": -0.002301842672750354,
+      "std": 1.1788493394851685
+    },
+    "GyroY_degs": {
+      "mean": -0.01383291371166706,
+      "std": 1.9010798931121826
+    },
+    "GyroZ_degs": {
+      "mean": 2.917557716369629,
+      "std": 15.904768943786621
+    },
+    "VehicleSpeed_ms": {
+      "mean": 6.743728160858154,
+      "std": 4.466681003570557
+    }
+  },
+  "norm_json": "C:\\Users\\nxj\\Desktop\\NewGPS\\GPS\\preprocessed_data\\normalization_stats_data0109.json",
+  "train_segments": [
+    "Data01_0109_1圈8字+2圈跑道",
+    "Data02_0109_2圈8字+2圈跑道",
+    "Data03_0109_1圈跑道+2圈8字",
+    "Data04_0109_2圈跑道+2圈8字"
+  ],
+  "val_segment": "Data05_0109_4圈跑道",
+  "train_samples": 3305,
+  "val_samples": 1347,
+  "best_val_mae": 0.060572441667318344,
+  "init_weights": "C:\\Users\\nxj\\Desktop\\NewGPS\\GPS\\trained_models\\biasnet_weights_cmcc.weights.h5",
+  "label_source": "CMCC_result calibration_type>=3",
+  "stable_tail_frac": 0.6,
+  "label_smooth": true,
+  "loss": "cmcc_stable_huber_equal_weights",
+  "biasnet_max_acc_g_inference": 0.2
+}

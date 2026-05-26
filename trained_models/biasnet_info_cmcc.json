@@ -1,0 +1,79 @@
+{
+  "arch": "deep",
+  "window_size": 200,
+  "target_dt": 0.1,
+  "output_dim": 6,
+  "output_channels": [
+    "ba_x[g]",
+    "ba_y[g]",
+    "ba_z[g]",
+    "bg_x[d/s]",
+    "bg_y[d/s]",
+    "bg_z[d/s]"
+  ],
+  "norm_stats": {
+    "AccX_g": {
+      "mean": 0.050599925220012665,
+      "std": 0.23002438247203827
+    },
+    "AccY_g": {
+      "mean": 0.05552501976490021,
+      "std": 0.08983633667230606
+    },
+    "AccZ_g": {
+      "mean": 0.9963411688804626,
+      "std": 0.05288269370794296
+    },
+    "GyroX_degs": {
+      "mean": -0.002301842672750354,
+      "std": 1.1788493394851685
+    },
+    "GyroY_degs": {
+      "mean": -0.01383291371166706,
+      "std": 1.9010798931121826
+    },
+    "GyroZ_degs": {
+      "mean": 2.917557716369629,
+      "std": 15.904768943786621
+    },
+    "VehicleSpeed_ms": {
+      "mean": 6.743728160858154,
+      "std": 4.466681003570557
+    }
+  },
+  "norm_json": "C:\\Users\\nxj\\Desktop\\NewGPS\\GPS\\preprocessed_data\\normalization_stats_data0109.json",
+  "train_segments": [
+    "Data01_0109_1圈8字+2圈跑道",
+    "Data02_0109_2圈8字+2圈跑道",
+    "Data03_0109_1圈跑道+2圈8字",
+    "Data04_0109_2圈跑道+2圈8字"
+  ],
+  "val_segment": "Data05_0109_4圈跑道",
+  "training": "dual_stage_plus_acc3",
+  "stage1": {
+    "mask": "cmcc_stable",
+    "settle_s": 60.0,
+    "weights": "C:\\Users\\nxj\\Desktop\\NewGPS\\GPS\\trained_models\\biasnet_weights_cmcc_s1.weights.h5",
+    "train_samples": 2502,
+    "best_val_mae": 0.02505291998386383
+  },
+  "stage2": {
+    "mask": "cmcc_stable",
+    "settle_s": 60.0,
+    "stable_tail_frac": null,
+    "label_smooth": true,
+    "weights": "C:\\Users\\nxj\\Desktop\\NewGPS\\GPS\\trained_models\\biasnet_weights_cmcc.weights.h5",
+    "train_samples": 2502,
+    "val_samples": 1494,
+    "best_val_mae": 0.02147398516535759
+  },
+  "stage3": {
+    "acc_label": "segment_stable_tail_60.0s_mean",
+    "acc_sample_dup": 2,
+    "loss": "acc_mse_focus + gyro_huber",
+    "best_val_mae": 0.02873685583472252
+  },
+  "loss": "huber_equal_weights_all_6_channels",
+  "biasnet_max_acc_g_inference": 0.25,
+  "init_baseline": "(from scratch)"
+}

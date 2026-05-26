@@ -17,9 +17,21 @@ python train_ekf.py
 
 # 3. 验证 GNSS 丢失场景（约 20 秒，生成 ekf_validation.png）
 python validate_ekf.py
+
+# 4. Data0109 CMCC 零偏评估（对比 CMCC_result 真值）
+python evaluate_bias_cmcc.py
+
+# 5. CMCC 三阶段微调（cmcc_ok 后再等 settle_s，默认 60s，才参与训练）
+python train_biasnet_cmcc.py
+python train_biasnet_cmcc.py --settle-s 50   # 稳定 50s 后再训练
+python train_biasnet_cmcc.py --acc-only      # 仅重跑阶段3
+python evaluate_bias_cmcc.py
+python evaluate_bias_cmcc.py --stable-only
 ```
 
 验证输出图片位于 `trained_models/ekf_validation.png` 和 `trained_models/ekf_diagnostics.png`。
+
+Data0109 评估图位于 `trained_models/cmcc_bias_compare_*.png`，日志在 `training_logs/cmcc_eval_*.json`。主用权重：`biasnet_weights_cmcc.weights.h5`；推理时自动叠加 `biasnet_cmcc_acc_calib.json` 的 acc 偏移。
 
 ## 代码架构
 
@@ -34,6 +46,12 @@ python validate_ekf.py
 - **`validate_ekf.py`** — 评估脚本：加载测试段（默认标定验证集 Data05），模拟 GNSS 丢失（90 秒），对比纯 DR 基准 vs BiasNet+EKF，绘制 2×2 对比图（轨迹叠加、误差曲线、航向、速度诊断）。
 
 - **`data_preprocessing_v2.py`** — 数据加载和预处理：GPS 异常点清洗（速度阈值 150 km/h）、WGS84→ENU 转换、传感器插值到 10 Hz 网格、滑窗生成。导出 `CALIB_TRAIN_IDS`、`CALIB_VAL_ID` 和跨文件使用的路径解析。
+
+- **`data0109_loader.py`** — Data0109 加载；`cmcc_ok`（标定有效）→ `cmcc_stable`（`cmcc_ok` 后再等 `CMCC_SETTLE_S=60s`，跳过静止/收敛初期）。
+
+- **`evaluate_bias_cmcc.py`** — CMCC 对比评估；推理仅在 `cmcc_stable` 段输出，段内默认 2s 平滑（`biasnet_postprocess.py`）。
+
+- **`train_biasnet_cmcc.py`** — 三阶段均在 `cmcc_stable`（默认 ok 后 60s）上训练；阶段3 为 acc 末 60s 常值 + tanh 对齐损失。详细说明见 [`docs/训练零偏文档.md`](训练零偏文档.md)。
 
 -  暂时不用：**`trajectory_data.py`** — 可视化/验证脚本的共享数据加载器：`load_segment()` 用于 260316 CSV 数据，`load_calibration_segment()` 用于标定数据。重新导出 `data_preprocessing_v2.py` 中的常量。
 
@@ -86,10 +104,19 @@ GPS/
 ├── validate_ekf.py         # EKF 验证与绘图
 ├── config.py               # EKFConfig 数据类（所有可调参数）
 ├── data_preprocessing_v2.py# 数据加载、GPS 清洗、ENU 转换
+├── data0109_loader.py      # Data0109 + CMCC 零偏加载
+├── evaluate_bias_cmcc.py   # CMCC 零偏对比评估
+├── train_biasnet_cmcc.py   # CMCC 监督微调
 ├── trajectory_data.py      # 验证用共享段加载器
+├── Data0109数据及零偏/       # 0109 实车 + CMCC_result 真值
 ├── trained_models/
 │   ├── biasnet_weights.weights.h5  # 训练好的 BiasNet 权重
+│   ├── biasnet_weights_cmcc.weights.h5        # CMCC 三阶段最终权重
+│   ├── biasnet_weights_cmcc_s1.weights.h5     # 阶段1
+│   ├── biasnet_cmcc_acc_calib.json            # 阶段3 估计的 acc 推理偏移 [g]
 │   ├── biasnet_info.json           # 训练元数据
+│   ├── biasnet_info_cmcc_stable.json
+│   ├── cmcc_bias_compare_*_stable.png
 │   ├── ekf_validation.png          # 主验证图
 │   └── ekf_diagnostics.png         # 诊断图
 └── preprocessed_data/

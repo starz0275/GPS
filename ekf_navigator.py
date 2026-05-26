@@ -113,6 +113,7 @@ def simulate_gnss_outage(
 
 class BiasNet(Model):
     """
+    浅版 BiasNet（保留作为基线/兼容旧权重）。
     输入：归一化后的 IMU 窗口  (batch, window, 7)
     输出：(batch, 6) — [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z]
       ba_x/y/z : 加速度计零偏 [g]
@@ -138,6 +139,83 @@ class BiasNet(Model):
         h = self.fc1(h)
         h = self.drop(h, training=training)
         return self.out(h)
+
+
+# ============================================================================
+# DeepBiasNet —— 扩窗 + 深 TCN（用于学习慢变零偏）
+# ============================================================================
+
+class _TCNBlock(layers.Layer):
+    """
+    两层 causal conv + BN + ReLU + 残差。
+    Kernel=3，receptive field per block ≈ 2*(k-1)*dilation = 4*dilation。
+    """
+
+    def __init__(self, channels: int, kernel: int, dilation: int, **kwargs):
+        super().__init__(**kwargs)
+        self.conv1 = layers.Conv1D(channels, kernel, dilation_rate=dilation,
+                                   padding='causal')
+        self.bn1 = layers.BatchNormalization()
+        self.conv2 = layers.Conv1D(channels, kernel, dilation_rate=dilation,
+                                   padding='causal')
+        self.bn2 = layers.BatchNormalization()
+
+    def call(self, x, training=False):
+        residual = x
+        h = self.conv1(x)
+        h = self.bn1(h, training=training)
+        h = tf.nn.relu(h)
+        h = self.conv2(h)
+        h = self.bn2(h, training=training)
+        return tf.nn.relu(h + residual)
+
+
+class DeepBiasNet(Model):
+    """
+    扩窗 TCN：默认 window=200（20s @ 10Hz），dilations=(1,2,4,8,16,32)
+    感受野 ≈ 1 + 4*sum(dilations) = 253 帧，覆盖整窗。
+
+    参数量 ~80k（channels=48 时）。
+    """
+
+    def __init__(self,
+                 window_size: int = 200,
+                 channels: int = 48,
+                 kernel: int = 3,
+                 dilations: Tuple[int, ...] = (1, 2, 4, 8, 16, 32),
+                 dropout: float = 0.2):
+        super().__init__(name='DeepBiasNet')
+        self.window_size = window_size
+        self.stem_conv = layers.Conv1D(channels, 5, padding='causal')
+        self.stem_bn = layers.BatchNormalization()
+        self.tcn_blocks = [
+            _TCNBlock(channels, kernel, d, name=f'tcn_d{d}') for d in dilations
+        ]
+        self.pool = layers.GlobalAveragePooling1D()
+        self.fc1 = layers.Dense(64, activation='relu')
+        self.drop = layers.Dropout(dropout)
+        self.out_layer = layers.Dense(6, activation='linear')
+
+    def call(self, x, training=False):
+        h = self.stem_conv(x)
+        h = self.stem_bn(h, training=training)
+        h = tf.nn.relu(h)
+        for blk in self.tcn_blocks:
+            h = blk(h, training=training)
+        h = self.pool(h)
+        h = self.fc1(h)
+        h = self.drop(h, training=training)
+        return self.out_layer(h)
+
+
+def make_biasnet(arch: str, window_size: int) -> Model:
+    """
+    arch: 'shallow' = 原 BiasNet；'deep' = DeepBiasNet（扩窗 TCN）
+    """
+    arch = (arch or 'shallow').lower()
+    if arch in ('deep', 'tcn', 'deeptcn', 'deepbiasnet'):
+        return DeepBiasNet(window_size=window_size)
+    return BiasNet(window_size=window_size)
 
 
 # ============================================================================
