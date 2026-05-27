@@ -1,15 +1,15 @@
 """
 BiasNet 推理后处理：仅在 cmcc_stable 段输出，并平滑抑制滑窗抖动。
+（已去掉中值滤波，仅保留 EMA + 步长限幅）
 """
 
 from __future__ import annotations
 
 import numpy as np
-from scipy.ndimage import median_filter
 
 from train_ekf import TARGET_DT
 
-# 默认：2s 中值 + EMA，每步最大变化（@10Hz）
+# 默认：EMA 时间常数 2s + 每步最大变化（@10Hz）
 DEFAULT_SMOOTH_S = 2.0
 DEFAULT_MAX_STEP_ACC_G = 0.0015
 DEFAULT_MAX_STEP_GYRO_DPS = 0.015
@@ -55,12 +55,11 @@ def smooth_bias_in_stable(
     max_step_acc_g: float = DEFAULT_MAX_STEP_ACC_G,
     max_step_gyro_dps: float = DEFAULT_MAX_STEP_GYRO_DPS,
 ) -> np.ndarray:
-    """仅在 stable 连续段内做中值 + EMA + 步长限幅。"""
+    """仅在 stable 连续段内做 EMA + 步长限幅（不含中值滤波）。"""
     out = bias.copy()
     if not stable.any() or smooth_s <= 0:
         return out
 
-    win = max(3, int(round(smooth_s / TARGET_DT)) | 1)
     alpha = TARGET_DT / (smooth_s + TARGET_DT)
     max_steps = np.array(
         [max_step_acc_g, max_step_acc_g, max_step_acc_g,
@@ -71,10 +70,8 @@ def smooth_bias_in_stable(
     for i0, i1 in _iter_stable_runs(stable):
         seg = out[i0:i1].copy()
         for c in range(6):
-            y = seg[:, c]
-            if len(y) >= win:
-                y = median_filter(y, size=win, mode="nearest")
-            y = _ema_1d(y.astype(np.float64), alpha).astype(np.float32)
+            y = seg[:, c].astype(np.float64)
+            y = _ema_1d(y, alpha).astype(np.float32)
             y = _rate_limit_1d(y, float(max_steps[c]))
             seg[:, c] = y
         out[i0:i1] = seg

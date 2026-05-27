@@ -26,7 +26,6 @@ python train_biasnet_cmcc.py
 python train_biasnet_cmcc.py --settle-s 50   # 稳定 50s 后再训练
 python train_biasnet_cmcc.py --acc-only      # 仅重跑阶段3
 python evaluate_bias_cmcc.py
-python evaluate_bias_cmcc.py --stable-only
 ```
 
 验证输出图片位于 `trained_models/ekf_validation.png` 和 `trained_models/ekf_diagnostics.png`。
@@ -116,7 +115,7 @@ GPS/
 │   ├── biasnet_cmcc_acc_calib.json            # 阶段3 估计的 acc 推理偏移 [g]
 │   ├── biasnet_info.json           # 训练元数据
 │   ├── biasnet_info_cmcc_stable.json
-│   ├── cmcc_bias_compare_*_stable.png
+│   ├── cmcc_bias_compare_*.png
 │   ├── ekf_validation.png          # 主验证图
 │   └── ekf_diagnostics.png         # 诊断图
 └── preprocessed_data/

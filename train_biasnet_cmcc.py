@@ -491,18 +491,6 @@ def run_dual_stage(
         ],
         check=False,
     )
-    subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "evaluate_bias_cmcc.py"),
-            "--weights",
-            str(FINAL_WEIGHTS),
-            "--norm-json",
-            str(NORM_JSON_0109),
-            "--stable-only",
-        ],
-        check=False,
-    )
     return info
 
 

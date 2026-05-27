@@ -1,7 +1,7 @@
 """
 evaluate_bias_cmcc.py — Data0109 CMCC 零偏对比评估
 ====================================================
-支持 cmcc_ok / cmcc_stable 两套指标；CMCC 路径推理 acc 限幅 0.15g。
+主指标与绘图均使用 cmcc_stable（cmcc_ok 后再等 settle_s，默认 60s）。
 """
 
 from __future__ import annotations
@@ -236,14 +236,14 @@ def evaluate_segment(
     }
 
 
-def plot_comparison(result: dict, out_path: Path, shade_stable: bool = True) -> None:
+def plot_comparison(result: dict, out_path: Path) -> None:
     t = result["Time_s"]
     y_cmcc = result["y_cmcc"]
     y_pred = result["y_pred"]
-    shade = result["mask_stable"] if shade_stable else result["mask_ok"]
+    shade = result["mask_stable"]
     seg = result["segment"]
     s = result.get("settle_s", CMCC_SETTLE_S)
-    tag = f"cmcc_stable(settle={s:.0f}s)" if shade_stable else "cmcc_ok"
+    tag = f"cmcc_stable(settle={s:.0f}s)"
 
     fig, axes = plt.subplots(3, 2, figsize=(14, 10), sharex=True)
     fig.suptitle(f"CMCC vs BiasNet — {seg} ({tag})", fontsize=12)
@@ -286,7 +286,6 @@ def run_evaluation(
     norm_json: Path,
     segments: list[str] | None = None,
     save_plots: bool = True,
-    stable_only_report: bool = False,
     settle_s: float = CMCC_SETTLE_S,
     smooth_s: float = DEFAULT_SMOOTH_S,
     mask_outside: bool = True,
@@ -313,16 +312,13 @@ def run_evaluation(
     mu, std, _ = load_or_compute_norm(seqs, norm_json)
 
     all_results = []
-    if mask_outside and not stable_only_report:
-        print("[提示] 段外不预测时主指标自动改用 cmcc_stable")
-        stable_only_report = True
-    report_key = "cmcc_stable" if stable_only_report else "cmcc_ok"
+    report_key = "cmcc_stable"
     print("\n" + "=" * 60)
-    print(f"CMCC 零偏评估（主指标: {report_key}）")
+    print(f"CMCC 零偏评估（{report_key}，cmcc_ok 后 settle={settle_s:.0f}s）")
     if mask_outside:
         print(f"  推理: 仅 cmcc_stable 输出 (settle={settle_s:.0f}s)，段外 NaN")
     if smooth_s > 0:
-        print(f"  平滑: median+EMA ~{smooth_s:.1f}s + 步长限幅")
+        print(f"  平滑: EMA ~{smooth_s:.1f}s + 步长限幅")
     print("=" * 60)
 
     for seq in seqs:
@@ -338,22 +334,19 @@ def run_evaluation(
             "Time_s": res["Time_s"],
             "y_cmcc": res["y_cmcc"],
             "y_pred": res["y_pred"],
-            "mask_ok": res["mask_ok"],
             "mask_stable": res["mask_stable"],
+            "settle_s": settle_s,
         }
         if save_plots:
             safe = seq["segment"].replace("+", "_").replace("圈", "q")
-            suffix = "_stable" if stable_only_report else ""
-            plot_path = MODEL_DIR / f"cmcc_bias_compare_{safe}{suffix}.png"
-            plot_comparison(plot_payload, plot_path, shade_stable=stable_only_report)
+            plot_path = MODEL_DIR / f"cmcc_bias_compare_{safe}.png"
+            plot_comparison(plot_payload, plot_path)
 
         print(
             f"\n[{res['segment']}] "
             f"cmcc_ok={res['cmcc_ok_ratio']:.1%}  cmcc_stable={res['cmcc_stable_ratio']:.1%}"
         )
         _print_metrics(report_key, res[report_key])
-        if not stable_only_report:
-            _print_metrics("cmcc_stable", res["cmcc_stable"])
 
         log_entry = {
             "segment": res["segment"],
@@ -361,15 +354,14 @@ def run_evaluation(
             "n_frames": res["n_frames"],
             "cmcc_ok_ratio": res["cmcc_ok_ratio"],
             "cmcc_stable_ratio": res["cmcc_stable_ratio"],
-            "cmcc_ok": res["cmcc_ok"],
-            "cmcc_stable": res["cmcc_stable"],
+            "metrics": res["cmcc_stable"],
         }
         all_results.append(log_entry)
 
     val_res = next(
         (r for r in all_results if DATA0109_VAL_SEGMENT in r["segment"]), None
     )
-    val_block = val_res[report_key] if val_res else {}
+    val_block = val_res["metrics"] if val_res else {}
     summary = {
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "weights": str(weights_path),
@@ -412,11 +404,6 @@ def main():
     )
     ap.add_argument("--no-plots", action="store_true", help="不保存对比图")
     ap.add_argument(
-        "--stable-only",
-        action="store_true",
-        help="主指标与绘图仅用 cmcc_stable（cmcc_ok 后再等 settle_s）",
-    )
-    ap.add_argument(
         "--settle-s",
         type=float,
         default=CMCC_SETTLE_S,
@@ -457,7 +444,6 @@ def main():
         args.norm_json,
         segments=args.segments,
         save_plots=not args.no_plots,
-        stable_only_report=args.stable_only,
         settle_s=args.settle_s,
         smooth_s=0.0 if args.no_smooth else args.smooth_s,
         mask_outside=not args.no_infer_mask,
