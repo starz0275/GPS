@@ -59,12 +59,24 @@ ACC_CALIB_JSON = MODEL_DIR / "biasnet_cmcc_acc_calib.json"
 
 # DeepBiasNet 默认窗口（20s @ 10Hz），shallow 仍 30 帧
 DEFAULT_ARCH = "deep"
-DEFAULT_WINDOW_DEEP = 200
+DEFAULT_WINDOW_DEEP = 300
+
+# 训练配置（优先提升陀螺 X/Y 泛化）
+LOSS_ACC_WEIGHTS = tf.constant([0.8, 0.8, 0.6], dtype=tf.float32)
+LOSS_GYRO_WEIGHTS = tf.constant([2.0, 2.25, 1.9], dtype=tf.float32)
+STAGE3_ACC_WEIGHTS = tf.constant([8.0, 8.0, 6.0], dtype=tf.float32)
+STAGE3_GYRO_WEIGHTS = tf.constant([2.0, 2.5, 2.5], dtype=tf.float32)
+STAGE1_LR_DEEP = 3e-4
+STAGE2_LR_DEEP = 5e-5
+STAGE3_ACC_SAMPLE_DUP = 1
+TEMP_CONSISTENCY_LAMBDA = 0.008
+TEMP_CONSISTENCY_GYRO_XY_WEIGHTS = tf.constant([1.0, 1.0], dtype=tf.float32)
+TEMP_CONSISTENCY_MAX_LABEL_DELTA = 0.03
 
 
 def cmcc_huber_loss_equal(y_true, y_pred):
-    """六轴等权 Huber。"""
-    weights = tf.ones(6, dtype=tf.float32)
+    """六轴加权 Huber（提高陀螺通道权重）。"""
+    weights = tf.concat([LOSS_ACC_WEIGHTS, LOSS_GYRO_WEIGHTS], axis=0)
     delta = 1.0
     error = y_true - y_pred
     abs_error = tf.abs(error)
@@ -72,6 +84,31 @@ def cmcc_huber_loss_equal(y_true, y_pred):
     linear = delta * (abs_error - 0.5 * delta)
     per_ch = tf.where(abs_error <= delta, quadratic, linear)
     return tf.reduce_mean(per_ch * weights)
+
+
+def cmcc_huber_with_temporal_consistency(y_true, y_pred):
+    """
+    六轴加权 Huber + 时间一致性损失。
+    时间一致性仅作用于陀螺 X/Y 两轴，约束相邻样本预测变化率，抑制抖动。
+    当相邻标签差分过大（通常是跨段或突变）时跳过该对样本，避免过度平滑。
+    """
+    base = cmcc_huber_loss_equal(y_true, y_pred)
+    n = tf.shape(y_pred)[0]
+
+    def _tc_term():
+        pred_diff = y_pred[1:, 3:5] - y_pred[:-1, 3:5]  # 仅 bg_x/bg_y
+        label_diff = tf.abs(y_true[1:, 3:5] - y_true[:-1, 3:5])
+        pair_keep = tf.reduce_all(label_diff <= TEMP_CONSISTENCY_MAX_LABEL_DELTA, axis=1)
+        pair_keep_f = tf.cast(pair_keep, tf.float32)
+        weighted = tf.reduce_sum(
+            tf.square(pred_diff) * TEMP_CONSISTENCY_GYRO_XY_WEIGHTS, axis=1
+        ) / tf.reduce_sum(TEMP_CONSISTENCY_GYRO_XY_WEIGHTS)
+        num = tf.reduce_sum(weighted * pair_keep_f)
+        den = tf.maximum(tf.reduce_sum(pair_keep_f), 1.0)
+        return num / den
+
+    tc = tf.cond(tf.less(n, 2), lambda: tf.constant(0.0, dtype=tf.float32), _tc_term)
+    return base + TEMP_CONSISTENCY_LAMBDA * tc
 
 
 def _phys_from_raw(y_pred_raw):
@@ -84,8 +121,8 @@ def _phys_from_raw(y_pred_raw):
 def cmcc_acc_inference_aligned_loss(y_true, y_pred_raw):
     """损失在物理量上计算（含 tanh），与 evaluate 推理一致。"""
     y_hat = _phys_from_raw(y_pred_raw)
-    acc_w = tf.constant([10.0, 10.0, 8.0], dtype=tf.float32)
-    gyro_w = tf.constant([1.0, 1.5, 1.5], dtype=tf.float32)
+    acc_w = STAGE3_ACC_WEIGHTS
+    gyro_w = STAGE3_GYRO_WEIGHTS
     acc_err = y_true[:, 0:3] - y_hat[:, 0:3]
     acc_loss = tf.reduce_mean(tf.square(acc_err) * acc_w)
     g_err = y_true[:, 3:6] - y_hat[:, 3:6]
@@ -97,8 +134,8 @@ def cmcc_acc_inference_aligned_loss(y_true, y_pred_raw):
 
 def cmcc_acc_focus_loss(y_true, y_pred):
     """线性输出上的 acc MSE（备用）。"""
-    acc_w = tf.constant([6.0, 6.0, 5.0], dtype=tf.float32)
-    gyro_w = tf.constant([1.0, 1.5, 1.5], dtype=tf.float32)
+    acc_w = STAGE3_ACC_WEIGHTS
+    gyro_w = STAGE3_GYRO_WEIGHTS
     acc_err = y_true[:, 0:3] - y_pred[:, 0:3]
     acc_loss = tf.reduce_mean(tf.square(acc_err) * acc_w)
     g_err = y_true[:, 3:6] - y_pred[:, 3:6]
@@ -208,6 +245,7 @@ def _fit_stage(
     patience: int,
     stage_name: str,
     loss_fn=cmcc_huber_loss_equal,
+    shuffle: bool = True,
 ):
     print(f"\n--- {stage_name} ---")
     print(f"  训练样本: {len(X_tr)}  验证: {len(X_val)}  LR={lr}  epochs={epochs}")
@@ -245,6 +283,7 @@ def _fit_stage(
         epochs=epochs,
         callbacks=callbacks,
         verbose=2,
+        shuffle=shuffle,
     )
     best = float(min(history.history["val_mae"]))
     print(f"  [{stage_name}] 最优 val_mae={best:.5f}  -> {out_weights.name}")
@@ -313,7 +352,7 @@ def run_acc_stage3(
         label_smooth=True,
         require_full_window=True,
         acc_constant_tail=True,
-        acc_sample_dup=2,
+        acc_sample_dup=STAGE3_ACC_SAMPLE_DUP,
     )
     X_val, Y_val = build_cmcc_samples(
         seqs_val, mu, std,
@@ -386,7 +425,7 @@ def run_dual_stage(
         mask1 = "cmcc_ok" if stage1_use_ok else f"cmcc_stable(settle={settle_s:.0f}s)"
         print(f"  掩码={mask1}, 样本={len(X1_tr)}")
         n_s1_tr, n_s1_val = len(X1_tr), len(X1_val)
-        s1_lr = 5e-4 if arch == "deep" else 2e-5
+        s1_lr = STAGE1_LR_DEEP if arch == "deep" else 2e-5
         s1_mae, _ = _fit_stage(
             model, X1_tr, Y1_tr, X1_val, Y1_val,
             STAGE1_WEIGHTS,
@@ -419,7 +458,7 @@ def run_dual_stage(
     if STAGE1_WEIGHTS.exists():
         model.load_weights(str(STAGE1_WEIGHTS))
     print(f"\n[阶段2] 从 {STAGE1_WEIGHTS.name} 初始化")
-    s2_lr = 1e-4 if arch == "deep" else 1e-5
+    s2_lr = STAGE2_LR_DEEP if arch == "deep" else 1e-5
     s2_mae, history2 = _fit_stage(
         model, X2_tr, Y2_tr, X2_val, Y2_val,
         FINAL_WEIGHTS,
@@ -427,6 +466,8 @@ def run_dual_stage(
         epochs=80,
         patience=15,
         stage_name=f"阶段2 cmcc_stable settle={settle_s:.0f}s",
+        loss_fn=cmcc_huber_with_temporal_consistency,
+        shuffle=False,
     )
 
     s3_mae = None
@@ -458,6 +499,12 @@ def run_dual_stage(
             "settle_s": settle_s,
             "stable_tail_frac": stable_tail_frac,
             "label_smooth": label_smooth_stage2,
+            "temporal_consistency": {
+                "enabled": True,
+                "lambda": TEMP_CONSISTENCY_LAMBDA,
+                "gyro_xy_weights": [1.0, 1.0],
+                "max_label_delta": TEMP_CONSISTENCY_MAX_LABEL_DELTA,
+            },
             "weights": str(FINAL_WEIGHTS),
             "train_samples": int(len(X2_tr)),
             "val_samples": int(len(X2_val)),
@@ -465,7 +512,7 @@ def run_dual_stage(
         },
         "stage3": {
             "acc_label": f"segment_stable_tail_{ACC_TAIL_S}s_mean",
-            "acc_sample_dup": 2,
+            "acc_sample_dup": STAGE3_ACC_SAMPLE_DUP,
             "loss": "acc_mse_focus + gyro_huber",
             "best_val_mae": s3_mae,
         },

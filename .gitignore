@@ -1,5 +1,5 @@
 # training_logs/
-__pycache__/
+__pycache__
 *.pyc
 .vscode/
 .idea/

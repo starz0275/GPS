@@ -1,6 +1,6 @@
 {
   "arch": "deep",
-  "window_size": 200,
+  "window_size": 300,
   "target_dt": 0.1,
   "output_dim": 6,
   "output_channels": [
@@ -41,7 +41,7 @@
       "std": 4.466681003570557
     }
   },
-  "norm_json": "C:\\Users\\nxj\\Desktop\\NewGPS\\GPS\\preprocessed_data\\normalization_stats_data0109.json",
+  "norm_json": "E:\\AAA-JJ\\GPS\\preprocessed_data\\normalization_stats_data0109.json",
   "train_segments": [
     "Data01_0109_1圈8字+2圈跑道",
     "Data02_0109_2圈8字+2圈跑道",
@@ -53,25 +53,34 @@
   "stage1": {
     "mask": "cmcc_stable",
     "settle_s": 60.0,
-    "weights": "C:\\Users\\nxj\\Desktop\\NewGPS\\GPS\\trained_models\\biasnet_weights_cmcc_s1.weights.h5",
-    "train_samples": 2502,
-    "best_val_mae": 0.02651471644639969
+    "weights": "E:\\AAA-JJ\\GPS\\trained_models\\biasnet_weights_cmcc_s1.weights.h5",
+    "train_samples": 2102,
+    "best_val_mae": 0.017917471006512642
   },
   "stage2": {
     "mask": "cmcc_stable",
     "settle_s": 60.0,
     "stable_tail_frac": null,
     "label_smooth": true,
-    "weights": "C:\\Users\\nxj\\Desktop\\NewGPS\\GPS\\trained_models\\biasnet_weights_cmcc.weights.h5",
-    "train_samples": 2502,
-    "val_samples": 1494,
-    "best_val_mae": 0.024701375514268875
+    "temporal_consistency": {
+      "enabled": true,
+      "lambda": 0.008,
+      "gyro_xy_weights": [
+        1.0,
+        1.0
+      ],
+      "max_label_delta": 0.03
+    },
+    "weights": "E:\\AAA-JJ\\GPS\\trained_models\\biasnet_weights_cmcc.weights.h5",
+    "train_samples": 2102,
+    "val_samples": 1394,
+    "best_val_mae": 0.021469850093126297
   },
   "stage3": {
     "acc_label": "segment_stable_tail_60.0s_mean",
-    "acc_sample_dup": 2,
+    "acc_sample_dup": 1,
     "loss": "acc_mse_focus + gyro_huber",
-    "best_val_mae": 0.02259753830730915
+    "best_val_mae": 0.027818217873573303
   },
   "loss": "huber_equal_weights_all_6_channels",
   "biasnet_max_acc_g_inference": 0.25,

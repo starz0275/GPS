@@ -53,6 +53,19 @@ CH_KEYS = ["ba_x_g", "ba_y_g", "ba_z_g", "bg_x_degs", "bg_y_degs", "bg_z_degs"]
 TAIL_S = 60.0
 
 
+def configure_matplotlib_cjk_font() -> None:
+    """配置 matplotlib 中文字体回退，避免标题/图例出现方块。"""
+    plt.rcParams["font.sans-serif"] = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "WenQuanYi Zen Hei",
+        "Arial Unicode MS",
+        "DejaVu Sans",
+    ]
+    plt.rcParams["axes.unicode_minus"] = False
+
+
 def cmcc_ekf_config() -> EKFConfig:
     return replace(
         DEFAULT_EKF_CONFIG,
@@ -293,6 +306,7 @@ def run_evaluation(
     window_size: int | None = None,
 ) -> dict:
     segments = segments or DATA0109_ALL_SEGMENTS
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if not weights_path.exists() and FALLBACK_WEIGHTS.exists():
         weights_path = FALLBACK_WEIGHTS
         print(f"[提示] 使用备用权重: {weights_path}")
@@ -339,7 +353,7 @@ def run_evaluation(
         }
         if save_plots:
             safe = seq["segment"].replace("+", "_").replace("圈", "q")
-            plot_path = MODEL_DIR / f"cmcc_bias_compare_{safe}.png"
+            plot_path = MODEL_DIR / f"cmcc_bias_compare_{run_timestamp}_{safe}.png"
             plot_comparison(plot_payload, plot_path)
 
         print(
@@ -363,7 +377,7 @@ def run_evaluation(
     )
     val_block = val_res["metrics"] if val_res else {}
     summary = {
-        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "timestamp": run_timestamp,
         "weights": str(weights_path),
         "norm_json": str(norm_json),
         "report_mask": report_key,
@@ -392,6 +406,7 @@ def save_log(summary: dict) -> Path:
 
 
 def main():
+    configure_matplotlib_cjk_font()
     ap = argparse.ArgumentParser(description="Data0109 CMCC 零偏评估")
     w_default = DEFAULT_WEIGHTS if DEFAULT_WEIGHTS.exists() else FALLBACK_WEIGHTS
     ap.add_argument("--weights", type=Path, default=w_default, help="BiasNet 权重")
