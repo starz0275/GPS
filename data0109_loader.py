@@ -36,6 +36,8 @@ CMCC_BIAS_COLS = [
     "gyro_bias_x", "gyro_bias_y", "gyro_bias_z",
 ]
 
+CMCC_ATTITUDE_COLS = ["CMCC_pitch", "CMCC_roll", "CMCC_yaw"]
+
 DEG2RAD = np.pi / 180.0
 EARTH_A = 6378137.0
 GPS_MAX_KMH = 150.0
@@ -226,6 +228,10 @@ def load_data0109_seq(
             [interp1(cmcc["Time_s"].values, cmcc[c].values) for c in CMCC_BIAS_COLS],
             axis=1,
         ).astype(np.float32)
+        cmcc_attitude_deg = np.stack(
+            [interp1(cmcc["Time_s"].values, cmcc[c].values) for c in CMCC_ATTITUDE_COLS],
+            axis=1,
+        ).astype(np.float32)  # (T, 3): pitch, roll, yaw [deg]
         ok = cmcc_ok_mask(cal_type, lat_cmcc)
         stable = cmcc_stable_mask(ok)
 
@@ -242,6 +248,7 @@ def load_data0109_seq(
             "enu_x": enu_x.astype(np.float32),
             "enu_y": enu_y.astype(np.float32),
             "cmcc_bias_6d": cmcc_bias,
+            "cmcc_attitude_deg": cmcc_attitude_deg,
             "cmcc_ok": ok,
             "cmcc_stable": stable,
             "calibration_type": cal_type,
