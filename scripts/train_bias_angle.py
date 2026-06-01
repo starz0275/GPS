@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""scripts/train_bias_angle.py — 端到端学习零偏(6) + 安装角(1)。
+"""端到端学习 6 轴全局零偏 + 3 轴全局安装角，并允许小零偏残差微调。
 
-思路 (参考 AI-IMU Dead-Reckoning 论文):
-  IMU窗口 → TCN → 零偏(ba_x/y/z, bg_x/y/z) + 安装角(ψ_install)
-  → 修正IMU → 航位推算积分 → 预测轨迹
-  → 与 GPS 轨迹真值对比 → 损失反传优化网络
+训练链路:
+  IMU窗口 -> BiasAngleNet 输出小零偏残差
+  全局零偏 + 残差 -> 去零偏
+  全局安装角 roll/pitch/yaw -> IMU系旋到车体系
+  航位推算 -> 轨迹与 GNSS ENU 真值对比 -> 反向优化
 
-输出: 6轴零偏 (acc 3 + gyro 3) + 1个安装角 (yaw, IMU→车体)
+最终标定输出以全局 6 零偏和全局 3 安装角为准；残差只作为慢漂补偿诊断。
 """
 
 from __future__ import annotations
@@ -21,158 +22,126 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, Model
-from tensorflow.keras.callbacks import (
-    EarlyStopping,
-    ReduceLROnPlateau,
-)
+from tensorflow.keras import Model, layers
 
 from data0109_loader import (
+    DATA0109_ALL_SEGMENTS,
     DATA0109_TRAIN_SEGMENTS,
     DATA0109_VAL_SEGMENT,
     load_data0109_segments,
 )
 from train_ekf import load_or_compute_norm, normalize_imu
 
-ROOT = Path(__file__).resolve().parent.parent
 NORM_JSON_0109 = ROOT / "preprocessed_data" / "normalization_stats_data0109.json"
 MODEL_DIR = ROOT / "trained_models"
 MODEL_DIR.mkdir(exist_ok=True)
 
 DEG2RAD = np.pi / 180.0
-TARGET_DT = 0.1  # 10 Hz
+RAD2DEG = 180.0 / np.pi
+TARGET_DT = 0.1
 
 
-# ====================================================================
-# 不同iable 航位推算
-# ====================================================================
+def wrap_angle_rad(x):
+    return tf.atan2(tf.sin(x), tf.cos(x))
 
-@tf.function
-def rotate_imu_to_body(acc_imu, gyro_imu_z, install_angle):
-    """将 IMU 系加速度/角速度旋转换算到车体系。
 
-    install_angle (ψ): IMU→车体的 yaw 旋转角 [rad]。
-    假设 pitch/install roll 为 0 (仅 yaw 偏差)。
+def wrap_angle_np(x):
+    return np.arctan2(np.sin(x), np.cos(x))
 
-    旋转矩阵:
-        R = [[ cosψ, sinψ, 0],
-             [-sinψ, cosψ, 0],
-             [    0,    0, 1]]
+
+def rotation_imu_to_body(v, install_rpy):
+    """用 ZYX 欧拉角将 IMU 系向量旋到车体系。
+
+    install_rpy: [roll, pitch, yaw] rad，全局固定安装角。
+    v: (..., 3)
     """
-    ca = tf.cos(install_angle)  # (B, 1)
-    sa = tf.sin(install_angle)
-    ax = acc_imu[:, 0:1]  # (B,)
-    ay = acc_imu[:, 1:2]
-    az = acc_imu[:, 2:3]
-    acc_body_x = ca * ax + sa * ay       # (B, 1)
-    acc_body_y = -sa * ax + ca * ay
-    acc_body_z = az  # Z 轴不变
-    acc_body = tf.concat([acc_body_x, acc_body_y, acc_body_z], axis=-1)  # (B, 3)
-    # 陀螺仪 Z 轴: 假设安装偏航角不影响 Z 轴角速度
-    gyro_body_z = gyro_imu_z  # (B,)
-    return acc_body, gyro_body_z
+    roll, pitch, yaw = tf.unstack(install_rpy)
+    cr, sr = tf.cos(roll), tf.sin(roll)
+    cp, sp = tf.cos(pitch), tf.sin(pitch)
+    cy, sy = tf.cos(yaw), tf.sin(yaw)
+
+    r00 = cy * cp
+    r01 = cy * sp * sr - sy * cr
+    r02 = cy * sp * cr + sy * sr
+    r10 = sy * cp
+    r11 = sy * sp * sr + cy * cr
+    r12 = sy * sp * cr - cy * sr
+    r20 = -sp
+    r21 = cp * sr
+    r22 = cp * cr
+
+    x, y, z = tf.unstack(v, axis=-1)
+    out_x = r00 * x + r01 * y + r02 * z
+    out_y = r10 * x + r11 * y + r12 * z
+    out_z = r20 * x + r21 * y + r22 * z
+    return tf.stack([out_x, out_y, out_z], axis=-1)
 
 
 @tf.function
 def integrate_trajectory(init_east, init_north, init_heading,
-                         acc_corrected, gyro_corrected_z, v_ms, dt):
-    """可微分的航位推算积分。
-
-    Args:
-        init_east, init_north: 初始位置 (B,)
-        init_heading:          初始航向角, 即 psi (B,) [rad], 0=East
-        acc_corrected:         去零偏加速度 (B, T, 3) [g]
-        gyro_corrected_z:      去零偏陀螺仪 Z (B, T) [deg/s]
-        v_ms:                  车速 (B, T) [m/s]
-        dt:                    时间步长 [s]
-
-    Returns:
-        pred_east, pred_north: 预测轨迹 (B, T+1)
-        pred_heading:          预测航向 (B, T+1) [rad]
-    """
-    batch_size = tf.shape(acc_corrected)[0]
-    seq_len = tf.shape(acc_corrected)[1]  # T
-
-    # 初始化
-    east = init_east       # (B,)
+                         acc_body, gyro_body_z, v_ms, dt):
+    """可微航位推算，返回 (B,T+1) 的 east/north/heading。"""
+    seq_len = tf.shape(acc_body)[1]
+    east = init_east
     north = init_north
-    psi = init_heading     # rad, 从 GPS 航向得到
+    psi = init_heading
 
-    east_list = tf.TensorArray(dtype=tf.float32, size=seq_len + 1,
-                               dynamic_size=False)
-    north_list = tf.TensorArray(dtype=tf.float32, size=seq_len + 1,
-                                dynamic_size=False)
-    psi_list = tf.TensorArray(dtype=tf.float32, size=seq_len + 1,
-                              dynamic_size=False)
-
+    east_list = tf.TensorArray(tf.float32, size=seq_len + 1)
+    north_list = tf.TensorArray(tf.float32, size=seq_len + 1)
+    psi_list = tf.TensorArray(tf.float32, size=seq_len + 1)
     east_list = east_list.write(0, east)
     north_list = north_list.write(0, north)
     psi_list = psi_list.write(0, psi)
 
-    g = 9.80665  # m/s²
+    g = tf.constant(9.80665, tf.float32)
 
     def body(i, east, north, psi, east_list, north_list, psi_list):
-        # 当前时刻的输入
-        ax = acc_corrected[:, i, 0]   # (B,) [g]
-        ay = acc_corrected[:, i, 1]   # (B,) [g]
-        dpsi = gyro_corrected_z[:, i] # (B,) [deg/s]
-        vi = v_ms[:, i]               # (B,) [m/s]
+        ax = acc_body[:, i, 0] * g
+        ay = acc_body[:, i, 1] * g
+        wz = gyro_body_z[:, i]
+        vi = v_ms[:, i]
 
-        # 加速度: g → m/s²
-        ax_ms2 = ax * g
-        ay_ms2 = ay * g
-
-        # 机体系加速度 → 导航系 (East, North)
         cp = tf.cos(psi)
         sp = tf.sin(psi)
-        acc_e = cp * ax_ms2 - sp * ay_ms2   # (B,)
-        acc_n = sp * ax_ms2 + cp * ay_ms2
+        acc_e = cp * ax - sp * ay
+        acc_n = sp * ax + cp * ay
 
-        # 积分速度 (以车速为基准, 加速度做修正)
-        dv_e = acc_e * dt   # (B,)
-        dv_n = acc_n * dt
-
-        # 积分位置: 用速度积分 (车速沿航向)
-        v_e = vi * cp + dv_e  # (B,)
-        v_n = vi * sp + dv_n
+        # 轮速提供主速度约束，加速度只做短时修正项。
+        v_e = vi * cp + acc_e * dt
+        v_n = vi * sp + acc_n * dt
 
         east = east + v_e * dt
         north = north + v_n * dt
-        psi = psi + dpsi * DEG2RAD * dt  # rad
+        psi = wrap_angle_rad(psi + wz * DEG2RAD * dt)
 
         east_list = east_list.write(i + 1, east)
         north_list = north_list.write(i + 1, north)
         psi_list = psi_list.write(i + 1, psi)
-
         return i + 1, east, north, psi, east_list, north_list, psi_list
 
     def cond(i, *_):
         return i < seq_len
 
-    _, east, north, psi, east_list, north_list, psi_list = tf.while_loop(
-        cond, body,
+    _, _, _, _, east_list, north_list, psi_list = tf.while_loop(
+        cond,
+        body,
         [tf.constant(0), east, north, psi, east_list, north_list, psi_list],
         parallel_iterations=1,
     )
 
-    pred_east = tf.transpose(east_list.stack())    # (B, T+1)
-    pred_north = tf.transpose(north_list.stack())
-    pred_heading = tf.transpose(psi_list.stack())
-    return pred_east, pred_north, pred_heading
+    return (
+        tf.transpose(east_list.stack()),
+        tf.transpose(north_list.stack()),
+        tf.transpose(psi_list.stack()),
+    )
 
-
-# ====================================================================
-# 网络: TCN → 零偏(6) + 安装角(1)
-# ====================================================================
 
 class _TCNBlock(layers.Layer):
     def __init__(self, channels, kernel, dilation, **kwargs):
         super().__init__(**kwargs)
-        self.conv1 = layers.Conv1D(channels, kernel, dilation_rate=dilation,
-                                   padding='causal')
+        self.conv1 = layers.Conv1D(channels, kernel, dilation_rate=dilation, padding="causal")
         self.bn1 = layers.BatchNormalization()
-        self.conv2 = layers.Conv1D(channels, kernel, dilation_rate=dilation,
-                                   padding='causal')
+        self.conv2 = layers.Conv1D(channels, kernel, dilation_rate=dilation, padding="causal")
         self.bn2 = layers.BatchNormalization()
 
     def call(self, x, training=False):
@@ -183,464 +152,449 @@ class _TCNBlock(layers.Layer):
 
 
 class BiasAngleNet(Model):
-    """TCN 网络: 从 IMU 窗口估计零偏(6) + 安装角(1)。"""
+    """全局 6 零偏 + 全局 3 安装角 + 窗口零偏残差网络。"""
 
-    def __init__(self, window_size: int = 200, channels: int = 48, **kwargs):
+    def __init__(
+        self,
+        window_size: int = 200,
+        channels: int = 48,
+        install_limit_deg: float = 10.0,
+        residual_acc_scale_g: float = 0.02,
+        residual_gyro_scale_degs: float = 0.02,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
-        self.stem_conv = layers.Conv1D(channels, 5, padding='causal')
+        self.window_size = window_size
+        self.install_limit_rad = float(install_limit_deg * DEG2RAD)
+        self.residual_scale = tf.constant(
+            [residual_acc_scale_g] * 3 + [residual_gyro_scale_degs] * 3,
+            dtype=tf.float32,
+        )
+
+        self.bias_base = self.add_weight(
+            name="bias_base",
+            shape=(6,),
+            initializer="zeros",
+            trainable=True,
+        )
+        self.install_raw = self.add_weight(
+            name="install_raw",
+            shape=(3,),
+            initializer="zeros",
+            trainable=True,
+        )
+
+        self.stem_conv = layers.Conv1D(channels, 5, padding="causal")
         self.stem_bn = layers.BatchNormalization()
-        dilations = (1, 2, 4, 8, 16, 32)
         self.tcn_blocks = [
-            _TCNBlock(channels, 3, d, name=f'tcn_d{d}') for d in dilations
+            _TCNBlock(channels, 3, d, name=f"tcn_d{d}") for d in (1, 2, 4, 8, 16, 32)
         ]
         self.pool = layers.GlobalAveragePooling1D()
-        self.fc1 = layers.Dense(64, activation='relu')
+        self.fc1 = layers.Dense(64, activation="relu")
         self.drop = layers.Dropout(0.2)
-        # 输出: [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z, install_angle]
-        #       acc_bias[g], gyro_bias[deg/s], install_angle[rad]
-        self.out_layer = layers.Dense(7, activation='linear')
+        self.residual_out = layers.Dense(6, activation="tanh")
+
+    @property
+    def install_rpy(self):
+        return tf.tanh(self.install_raw) * self.install_limit_rad
 
     def call(self, x, training=False):
-        h = self.stem_bn(self.stem_conv(x), training=training)
-        h = tf.nn.relu(h)
-        for blk in self.tcn_blocks:
-            h = blk(h, training=training)
+        h = tf.nn.relu(self.stem_bn(self.stem_conv(x), training=training))
+        for block in self.tcn_blocks:
+            h = block(h, training=training)
         h = self.pool(h)
         h = self.drop(self.fc1(h), training=training)
-        out = self.out_layer(h)  # (B, 7)
-        # 分离零偏和安装角
-        bias = out[:, :6]           # (B, 6): [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z]
-        install_angle = out[:, 6:7] # (B, 1): install yaw [rad]
-        return bias, install_angle
+        residual = self.residual_out(h) * self.residual_scale
+        bias_used = tf.expand_dims(self.bias_base, axis=0) + residual
+        return bias_used, residual, self.install_rpy
+
+    def fixed_bias_batch(self, batch_size):
+        return tf.tile(tf.expand_dims(self.bias_base, axis=0), [batch_size, 1])
 
 
-# ====================================================================
-# 窗口构造
-# ====================================================================
-
-def build_windows(seqs, mu, std, window_size=200, use_install_gt=True):
-    """构造训练窗口: IMU + GPS 轨迹真值 + 安装角真值。"""
-    X, V, GPS_EAST, GPS_NORTH, GPS_HEAD, GPS_VALID = [], [], [], [], [], []
-    INSTALL_PITCH_GT, INSTALL_YAW_GT = [], []  # 安装角真值
+def build_windows(seqs, mu, std, window_size=200):
+    X, V, GPS_EAST, GPS_NORTH, GPS_HEAD = [], [], [], [], []
+    POS_VALID, HEAD_VALID = [], []
 
     for seq in seqs:
-        imu_norm = normalize_imu(seq['imu'], mu, std)
-        v_ms = seq['v_ms']
-        enu_e = seq['enu_x']
-        enu_n = seq['enu_y']
-        gps_theta = seq['gps_theta']
-        gps_valid = seq['gps_valid']
-        T = len(seq['imu'])
-
-        # 安装角真值
-        has_install = 'cmcc_install_deg' in seq
-        cmcc_ok = seq.get('cmcc_ok', np.zeros(T, dtype=bool))
-        if has_install:
-            install_deg = seq['cmcc_install_deg']  # (T, 2): rbv_pitch, rbv_yaw [deg]
+        imu_norm = normalize_imu(seq["imu"], mu, std)
+        v_ms = seq["v_ms"]
+        enu_e = seq["enu_x"]
+        enu_n = seq["enu_y"]
+        gps_theta = seq["gps_theta"]
+        pos_valid = seq.get("gps_pos_valid", seq["gps_valid"])
+        head_valid = seq["gps_valid"]
+        T = len(seq["imu"])
 
         for i in range(0, T - window_size):
-            # 窗口起点的 GPS 信息作为初始条件
-            if not gps_valid[i]:
-                continue
-            # 窗口内需要有足够的 GPS 有效点
             end = i + window_size
-            gps_slice = gps_valid[i:end]
-            if gps_slice.sum() < window_size * 0.5:
+            if not head_valid[i]:
+                continue
+            if pos_valid[i:end + 1].sum() < (window_size + 1) * 0.5:
                 continue
 
             X.append(imu_norm[i:end])
             V.append(v_ms[i:end])
-            GPS_EAST.append(enu_e[i:end + 1])    # T+1 个点
+            GPS_EAST.append(enu_e[i:end + 1])
             GPS_NORTH.append(enu_n[i:end + 1])
             GPS_HEAD.append(gps_theta[i:end + 1])
-            GPS_VALID.append(gps_valid[i:end + 1])
+            POS_VALID.append(pos_valid[i:end + 1])
+            HEAD_VALID.append(head_valid[i:end + 1])
 
-            # 安装角真值: 取窗口内 cmcc_ok 的均值
-            if has_install and use_install_gt:
-                win_ok = cmcc_ok[i:end]
-                if win_ok.sum() > 0:
-                    pitch_gt = np.mean(install_deg[i:end, 0][win_ok])  # rbv_pitch
-                    yaw_gt = np.mean(install_deg[i:end, 1][win_ok])    # rbv_yaw
-                else:
-                    pitch_gt = 0.0
-                    yaw_gt = 0.0
-                INSTALL_PITCH_GT.append(pitch_gt)
-                INSTALL_YAW_GT.append(yaw_gt)
+    if not X:
+        raise RuntimeError("没有足够的 GNSS 有效窗口")
 
-    if len(X) == 0:
-        raise RuntimeError('没有足够的 GPS 有效窗口')
-
-    result = [
-        np.stack(X).astype(np.float32),       # (N, T, 7)
-        np.stack(V).astype(np.float32),        # (N, T)
-        np.stack(GPS_EAST).astype(np.float32), # (N, T+1)
+    return (
+        np.stack(X).astype(np.float32),
+        np.stack(V).astype(np.float32),
+        np.stack(GPS_EAST).astype(np.float32),
         np.stack(GPS_NORTH).astype(np.float32),
         np.stack(GPS_HEAD).astype(np.float32),
-        np.stack(GPS_VALID).astype(bool),
-    ]
-
-    if has_install and use_install_gt and len(INSTALL_PITCH_GT) > 0:
-        result.append(np.array(INSTALL_PITCH_GT, dtype=np.float32))
-        result.append(np.array(INSTALL_YAW_GT, dtype=np.float32))
-
-    return tuple(result)
+        np.stack(POS_VALID).astype(bool),
+        np.stack(HEAD_VALID).astype(bool),
+    )
 
 
-# ====================================================================
-# 损失函数
-# ====================================================================
-
-def trajectory_loss(pred_east, pred_north, pred_heading,
-                    true_east, true_north, true_heading, true_valid,
-                    pred_install_angle=None, true_install_yaw=None,
-                    install_weight=1.0):
-    """轨迹 RMSE + 航向 RMSE + 安装角监督损失。"""
-    # 位置误差
-    de = pred_east - true_east         # (B, T+1)
-    dn = pred_north - true_north
-    pos_err_sq = de * de + dn * dn     # (B, T+1)
-
-    # 用 GPS 有效帧计算均值
-    valid_f = tf.cast(true_valid, tf.float32)  # (B, T+1)
-    # 有效帧至少为 1
-    n_valid = tf.maximum(tf.reduce_sum(valid_f, axis=1), 1.0)  # (B,)
-    pos_mse = tf.reduce_sum(pos_err_sq * valid_f, axis=1) / n_valid  # (B,)
-    pos_rmse = tf.sqrt(tf.maximum(pos_mse, 1e-12))  # (B,)
-
-    # 航向误差 (角度环绕)
-    head_diff = pred_heading - true_heading
-    head_err = tf.abs(tf.atan2(tf.sin(head_diff), tf.cos(head_diff)))  # (B, T+1)
-    head_mse = tf.reduce_sum(head_err * valid_f, axis=1) / n_valid     # (B,)
-
-    # 安装角监督损失 (如果提供)
-    install_loss = tf.constant(0.0, dtype=tf.float32)
-    if pred_install_angle is not None and true_install_yaw is not None:
-        # pred_install_angle: (B, 1) [rad]
-        # true_install_yaw: (B,) [deg]
-        pred_yaw_deg = pred_install_angle[:, 0] * (180.0 / np.pi)  # (B,) [deg]
-        # 角度差 (考虑环绕)
-        angle_diff = pred_yaw_deg - true_install_yaw
-        angle_diff = tf.atan2(tf.sin(angle_diff * DEG2RAD), tf.cos(angle_diff * DEG2RAD)) / DEG2RAD
-        install_loss = tf.reduce_mean(tf.square(angle_diff))  # MSE in degrees
-
-    total_loss = tf.reduce_mean(pos_rmse) + 0.1 * tf.reduce_mean(head_mse) + install_weight * install_loss
-    return total_loss, tf.reduce_mean(pos_rmse), tf.reduce_mean(head_mse), install_loss
-
-
-# ====================================================================
-# 单步积分 (batch 内并行)
-# ====================================================================
-
-def batch_integrate(imu_batch, v_batch, bias, install_angle,
-                    init_east, init_north, init_heading):
-    """对一个 batch 做航位推算积分。
-
-    Args:
-        imu_batch:     (B, T, 7) 归一化 IMU
-        v_batch:       (B, T) 车速 [m/s]
-        bias:          (B, 6) [ba_x, ba_y, ba_z, bg_x, bg_y, bg_z]
-        install_angle: (B, 1) [rad]
-        init_east:     (B,) 初始东向位置
-        init_north:    (B,) 初始北向位置
-        init_heading:  (B,) 初始航向 [rad]
-
-    Returns:
-        pred_east, pred_north, pred_heading: (B, T+1)
-    """
-    B = tf.shape(imu_batch)[0]
-    T = tf.shape(imu_batch)[1]
-
-    # 提取 IMU 原始值 (归一化后的, 需要先还原, 然后去零偏)
-    # 但这里我们直接在归一化域操作:
-    # 归一化 IMU = (raw - mu) / std
-    # 去零偏: raw_corrected = (raw - bias) = (norm * std + mu - bias)
-    # 为了端到端学习, 我们让网络直接学归一化域的偏移:
-    # norm_corrected = norm - bias_norm, 其中 bias_norm = bias / std
-    # 但为了简化, 直接在原始值上操作更清晰
-    # → 不归一化, 直接用原始 IMU 值
-    # 然而网络输入还是归一化的, 输出的零偏也应该是物理单位
-    pass
-
-
-# ====================================================================
-# 数据准备
-# ====================================================================
-
-def prepare_dataset(X, V, ge, gn, gh, gv, batch_size, shuffle=True,
-                     install_pitch_gt=None, install_yaw_gt=None):
-    if install_pitch_gt is not None and install_yaw_gt is not None:
-        ds = tf.data.Dataset.from_tensor_slices((X, V, ge, gn, gh, gv, install_pitch_gt, install_yaw_gt))
-    else:
-        ds = tf.data.Dataset.from_tensor_slices((X, V, ge, gn, gh, gv))
+def prepare_dataset(X, V, ge, gn, gh, pos_v, head_v, batch_size, shuffle=True):
+    ds = tf.data.Dataset.from_tensor_slices((X, V, ge, gn, gh, pos_v, head_v))
     if shuffle:
         ds = ds.shuffle(buffer_size=min(len(X), 4096), reshuffle_each_iteration=True)
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
+def apply_bias_and_install(imu_norm, bias_used, install_rpy, mu, std):
+    std_t = tf.constant(std, dtype=tf.float32)
+    mu_t = tf.constant(mu, dtype=tf.float32)
+
+    acc_raw = imu_norm[:, :, :3] * std_t[:3] + mu_t[:3]
+    gyro_raw = imu_norm[:, :, 3:6] * std_t[3:6] + mu_t[3:6]
+
+    ba = bias_used[:, :3]
+    bg = bias_used[:, 3:6]
+    acc_corr = acc_raw - tf.expand_dims(ba, axis=1)
+    gyro_corr = gyro_raw - tf.expand_dims(bg, axis=1)
+
+    acc_body = rotation_imu_to_body(acc_corr, install_rpy)
+    gyro_body = rotation_imu_to_body(gyro_corr, install_rpy)
+    return acc_body, gyro_body[:, :, 2]
+
+
+def predict_trajectory(model, imu_norm, v_ms, true_e, true_n, true_h, mu, std, use_residual=True, training=False):
+    if use_residual:
+        bias_used, residual, install_rpy = model(imu_norm, training=training)
+    else:
+        batch_size = tf.shape(imu_norm)[0]
+        bias_used = model.fixed_bias_batch(batch_size)
+        residual = tf.zeros_like(bias_used)
+        install_rpy = model.install_rpy
+
+    acc_body, gyro_body_z = apply_bias_and_install(imu_norm, bias_used, install_rpy, mu, std)
+    pred_e, pred_n, pred_h = integrate_trajectory(
+        true_e[:, 0],
+        true_n[:, 0],
+        true_h[:, 0],
+        acc_body,
+        gyro_body_z,
+        v_ms,
+        TARGET_DT,
+    )
+    return pred_e, pred_n, pred_h, bias_used, residual, install_rpy
+
+
+def trajectory_loss(pred_e, pred_n, pred_h, true_e, true_n, true_h,
+                    pos_valid, head_valid, residual,
+                    head_weight=2.0, residual_l2_weight=50.0, base_l2=0.0):
+    pos_valid_f = tf.cast(pos_valid, tf.float32)
+    head_valid_f = tf.cast(head_valid, tf.float32)
+
+    pos_err = tf.sqrt(tf.maximum((pred_e - true_e) ** 2 + (pred_n - true_n) ** 2, 1e-12))
+    n_pos = tf.maximum(tf.reduce_sum(pos_valid_f, axis=1), 1.0)
+    pos_rmse = tf.sqrt(tf.reduce_sum((pos_err ** 2) * pos_valid_f, axis=1) / n_pos)
+
+    head_err = tf.abs(wrap_angle_rad(pred_h - true_h))
+    n_head = tf.maximum(tf.reduce_sum(head_valid_f, axis=1), 1.0)
+    head_rmse = tf.sqrt(tf.reduce_sum((head_err ** 2) * head_valid_f, axis=1) / n_head)
+
+    residual_l2 = tf.reduce_mean(tf.square(residual))
+    total = (
+        tf.reduce_mean(pos_rmse)
+        + head_weight * tf.reduce_mean(head_rmse)
+        + residual_l2_weight * residual_l2
+        + base_l2
+    )
+    return total, tf.reduce_mean(pos_rmse), tf.reduce_mean(head_rmse), residual_l2
+
+
+def collect_metrics(model, ds, mu, std, use_residual=True):
+    pos_errs, head_errs, residuals = [], [], []
+    for batch in ds:
+        imu, v, ge, gn, gh, pos_v, head_v = batch
+        pred_e, pred_n, pred_h, _, residual, _ = predict_trajectory(
+            model, imu, v, ge, gn, gh, mu, std,
+            use_residual=use_residual,
+            training=False,
+        )
+        pos_v_np = pos_v.numpy().astype(bool)
+        head_v_np = head_v.numpy().astype(bool)
+        pos_err = np.sqrt((pred_e.numpy() - ge.numpy()) ** 2 + (pred_n.numpy() - gn.numpy()) ** 2)
+        head_err = np.abs(wrap_angle_np(pred_h.numpy() - gh.numpy())) * RAD2DEG
+        pos_errs.append(pos_err[pos_v_np])
+        head_errs.append(head_err[head_v_np])
+        residuals.append(residual.numpy())
+
+    pos_all = np.concatenate(pos_errs) if pos_errs else np.array([], dtype=np.float32)
+    head_all = np.concatenate(head_errs) if head_errs else np.array([], dtype=np.float32)
+    res_all = np.concatenate(residuals, axis=0) if residuals else np.zeros((0, 6), dtype=np.float32)
+
+    def stats(arr):
+        if len(arr) == 0:
+            return {"mean": None, "rmse": None, "p95": None, "max": None}
+        return {
+            "mean": float(np.mean(arr)),
+            "rmse": float(np.sqrt(np.mean(arr ** 2))),
+            "p95": float(np.percentile(arr, 95)),
+            "max": float(np.max(arr)),
+        }
+
+    return {
+        "position_m": stats(pos_all),
+        "heading_deg": stats(head_all),
+        "residual": {
+            "mean": res_all.mean(axis=0).astype(float).tolist() if len(res_all) else [0.0] * 6,
+            "std": res_all.std(axis=0).astype(float).tolist() if len(res_all) else [0.0] * 6,
+            "max_abs": np.max(np.abs(res_all), axis=0).astype(float).tolist() if len(res_all) else [0.0] * 6,
+        },
+    }
+
+
+def install_gt_eval(seqs, install_rpy_deg):
+    pitch_vals, yaw_vals = [], []
+    for seq in seqs:
+        install = seq.get("cmcc_install_deg")
+        stable = seq.get("cmcc_stable")
+        if install is None or stable is None or not stable.any():
+            continue
+        pitch_vals.append(install[stable, 0])
+        yaw_vals.append(install[stable, 1])
+    if not pitch_vals:
+        return {}
+    pitch = np.concatenate(pitch_vals)
+    yaw = np.concatenate(yaw_vals)
+    return {
+        "cmcc_pitch_mean_deg": float(np.mean(pitch)),
+        "cmcc_yaw_mean_deg": float(np.mean(yaw)),
+        "pitch_error_deg": float(install_rpy_deg[1] - np.mean(pitch)),
+        "yaw_error_deg": float(install_rpy_deg[2] - np.mean(yaw)),
+        "roll_note": "CMCC result has rbv_pitch/rbv_yaw only; no roll GT is available.",
+    }
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description='End-to-end train bias(6) + install_angle(1) via trajectory loss + install GT')
-    parser.add_argument('--window-size', type=int, default=200)
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--epochs', type=int, default=80)
-    parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--model-name', type=str, default='bias_angle')
-    parser.add_argument('--install-weight', type=float, default=1.0,
-                        help='安装角监督损失权重 (默认1.0)')
-    parser.add_argument('--no-install-gt', action='store_true',
-                        help='不使用安装角真值监督')
+    parser = argparse.ArgumentParser(description="Train global bias(6) + global install RPY(3) with trajectory loss.")
+    parser.add_argument("--window-size", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--model-name", type=str, default="bias_angle_v3")
+    parser.add_argument("--head-weight", type=float, default=2.0)
+    parser.add_argument("--residual-l2-weight", type=float, default=50.0)
+    parser.add_argument("--bias-l2-weight", type=float, default=0.1)
+    parser.add_argument("--install-l2-weight", type=float, default=1.0)
+    parser.add_argument("--install-prior-scale-deg", type=float, default=5.0)
+    parser.add_argument("--install-limit-deg", type=float, default=10.0)
+    parser.add_argument("--residual-acc-scale-g", type=float, default=0.02)
+    parser.add_argument("--residual-gyro-scale-degs", type=float, default=0.02)
+    parser.add_argument("--patience", type=int, default=15)
     args = parser.parse_args()
 
-    use_install_gt = not args.no_install_gt
-
-    print('[Info] Loading Data0109 segments...')
-    seqs_tr = load_data0109_segments(DATA0109_TRAIN_SEGMENTS)
-    seqs_val = load_data0109_segments([DATA0109_VAL_SEGMENT])
-    seqs_tr = [s for s in seqs_tr if s is not None]
-    seqs_val = [s for s in seqs_val if s is not None]
+    print("[Info] Loading Data0109 segments...")
+    seqs_tr = [s for s in load_data0109_segments(DATA0109_TRAIN_SEGMENTS) if s is not None]
+    seqs_val = [s for s in load_data0109_segments([DATA0109_VAL_SEGMENT]) if s is not None]
+    if not seqs_tr or not seqs_val:
+        raise RuntimeError("训练或验证数据为空")
 
     mu, std, _ = load_or_compute_norm(seqs_tr, NORM_JSON_0109)
 
-    print('[Info] Building windows...')
-    W = args.window_size
+    print("[Info] Building windows...")
+    train_data = build_windows(seqs_tr, mu, std, args.window_size)
+    val_data = build_windows(seqs_val, mu, std, args.window_size)
+    X_tr, V_tr, ge_tr, gn_tr, gh_tr, posv_tr, headv_tr = train_data
+    X_val, V_val, ge_val, gn_val, gh_val, posv_val, headv_val = val_data
+    print(f"  Train windows: {len(X_tr)}")
+    print(f"  Val   windows: {len(X_val)}")
 
-    # 构造训练窗口 (含安装角真值)
-    train_result = build_windows(seqs_tr, mu, std, W, use_install_gt=use_install_gt)
-    val_result = build_windows(seqs_val, mu, std, W, use_install_gt=use_install_gt)
+    train_ds = prepare_dataset(*train_data, batch_size=args.batch_size, shuffle=True)
+    val_ds = prepare_dataset(*val_data, batch_size=args.batch_size, shuffle=False)
 
-    if use_install_gt and len(train_result) > 6:
-        X_tr, V_tr, ge_tr, gn_tr, gh_tr, gv_tr, ip_tr, iy_tr = train_result
-        X_val, V_val, ge_val, gn_val, gh_val, gv_val, ip_val, iy_val = val_result
-        print(f'  Train windows: {len(X_tr)} (install_gt: {len(ip_tr)})')
-        print(f'  Val   windows: {len(X_val)} (install_gt: {len(ip_val)})')
-        print(f'  Install yaw GT (train): mean={np.mean(iy_tr):.2f}° std={np.std(iy_tr):.2f}°')
-        print(f'  Install yaw GT (val):   mean={np.mean(iy_val):.2f}° std={np.std(iy_val):.2f}°')
-    else:
-        X_tr, V_tr, ge_tr, gn_tr, gh_tr, gv_tr = train_result[:6]
-        X_val, V_val, ge_val, gn_val, gh_val, gv_val = val_result[:6]
-        ip_tr, iy_tr = None, None
-        ip_val, iy_val = None, None
-        print(f'  Train windows: {len(X_tr)}')
-        print(f'  Val   windows: {len(X_val)}')
+    print("[Info] Creating model...")
+    model = BiasAngleNet(
+        window_size=args.window_size,
+        install_limit_deg=args.install_limit_deg,
+        residual_acc_scale_g=args.residual_acc_scale_g,
+        residual_gyro_scale_degs=args.residual_gyro_scale_degs,
+    )
+    model(tf.zeros((1, args.window_size, 7), dtype=tf.float32))
+    print(f"  Output: global bias(6) + global install_rpy(3) + residual_bias(6)")
+    print(f"  Total params: {model.count_params()}")
+    print(f"  Install angle limit: ±{args.install_limit_deg:.1f}°")
 
-    train_ds = prepare_dataset(X_tr, V_tr, ge_tr, gn_tr, gh_tr, gv_tr,
-                               args.batch_size, shuffle=True,
-                               install_pitch_gt=ip_tr, install_yaw_gt=iy_tr)
-    val_ds = prepare_dataset(X_val, V_val, ge_val, gn_val, gh_val, gv_val,
-                             args.batch_size, shuffle=False,
-                             install_pitch_gt=ip_val, install_yaw_gt=iy_val)
-
-    print('[Info] Creating model...')
-    model = BiasAngleNet(window_size=W)
-    model(tf.zeros((1, W, 7), dtype=tf.float32))
-    print(f'  Output: 6 bias + 1 install_angle = 7 params')
-    print(f'  Total params: {model.count_params()}')
-    print(f'  Install GT supervision: {use_install_gt}')
-    print(f'  Install loss weight: {args.install_weight}')
-
-    optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
+    optimizer = tf.keras.optimizers.Adam(args.lr)
+    weights_path = MODEL_DIR / f"{args.model_name}.weights.h5"
 
     @tf.function
-    def train_step(imu_norm, v_ms, true_e, true_n, true_h, true_v,
-                   true_pitch_gt=None, true_yaw_gt=None):
+    def train_step(imu, v, ge, gn, gh, pos_v, head_v):
         with tf.GradientTape() as tape:
-            bias, install_angle = model(imu_norm, training=True)
-
-            std_t = tf.constant(std, dtype=tf.float32)
-            mu_t = tf.constant(mu, dtype=tf.float32)
-
-            acc_raw = imu_norm[:, :, :3] * std_t[:3] + mu_t[:3]
-            gyro_z_raw = (imu_norm[:, :, 5] * std_t[5] + mu_t[5])
-
-            ba = bias[:, :3]
-            bg_z = bias[:, 5]
-            acc_corr = acc_raw - tf.expand_dims(ba, axis=1)
-            gyro_corr_z = gyro_z_raw - tf.expand_dims(bg_z, axis=1)
-
-            B_s = tf.shape(acc_corr)[0]
-            T_s = tf.shape(acc_corr)[1]
-            acc_corr_flat = tf.reshape(acc_corr, (-1, 3))
-            gyro_corr_z_flat = tf.reshape(gyro_corr_z, (-1,))
-            angle_flat = tf.repeat(install_angle, T_s, axis=0)
-            acc_body_flat, gyro_body_z_flat = rotate_imu_to_body(
-                acc_corr_flat, gyro_corr_z_flat, angle_flat)
-            acc_body = tf.reshape(acc_body_flat, (B_s, T_s, 3))
-            gyro_body_z = tf.reshape(gyro_body_z_flat, (B_s, T_s))
-
-            init_e = true_e[:, 0]
-            init_n = true_n[:, 0]
-            init_h = true_h[:, 0]
-
-            pred_e, pred_n, pred_h = integrate_trajectory(
-                init_e, init_n, init_h,
-                acc_body, gyro_body_z, v_ms, TARGET_DT)
-
-            # 损失 (含安装角监督)
-            loss, pos_loss, head_loss, install_loss = trajectory_loss(
-                pred_e, pred_n, pred_h,
-                true_e, true_n, true_h, true_v,
-                pred_install_angle=install_angle,
-                true_install_yaw=true_yaw_gt,
-                install_weight=args.install_weight)
-
+            pred_e, pred_n, pred_h, _, residual, _ = predict_trajectory(
+                model, imu, v, ge, gn, gh, mu, std,
+                use_residual=True,
+                training=True,
+            )
+            install_deg = model.install_rpy * RAD2DEG
+            base_l2 = (
+                args.bias_l2_weight * tf.reduce_mean(tf.square(model.bias_base))
+                + args.install_l2_weight
+                * tf.reduce_mean(tf.square(install_deg / args.install_prior_scale_deg))
+            )
+            loss, pos_l, head_l, res_l = trajectory_loss(
+                pred_e, pred_n, pred_h, ge, gn, gh, pos_v, head_v, residual,
+                head_weight=args.head_weight,
+                residual_l2_weight=args.residual_l2_weight,
+                base_l2=base_l2,
+            )
         grads = tape.gradient(loss, model.trainable_variables)
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
-        return loss, pos_loss, head_loss, install_loss
+        return loss, pos_l, head_l, res_l
 
     @tf.function
-    def val_step(imu_norm, v_ms, true_e, true_n, true_h, true_v,
-                 true_pitch_gt=None, true_yaw_gt=None):
-        bias, install_angle = model(imu_norm, training=False)
-        std_t = tf.constant(std, dtype=tf.float32)
-        mu_t = tf.constant(mu, dtype=tf.float32)
+    def val_step(imu, v, ge, gn, gh, pos_v, head_v):
+        pred_e, pred_n, pred_h, _, residual, _ = predict_trajectory(
+            model, imu, v, ge, gn, gh, mu, std,
+            use_residual=True,
+            training=False,
+        )
+        install_deg = model.install_rpy * RAD2DEG
+        base_l2 = (
+            args.bias_l2_weight * tf.reduce_mean(tf.square(model.bias_base))
+            + args.install_l2_weight
+            * tf.reduce_mean(tf.square(install_deg / args.install_prior_scale_deg))
+        )
+        return trajectory_loss(
+            pred_e, pred_n, pred_h, ge, gn, gh, pos_v, head_v, residual,
+            head_weight=args.head_weight,
+            residual_l2_weight=args.residual_l2_weight,
+            base_l2=base_l2,
+        )
 
-        acc_raw = imu_norm[:, :, :3] * std_t[:3] + mu_t[:3]
-        gyro_z_raw = (imu_norm[:, :, 5] * std_t[5] + mu_t[5])
-
-        ba = bias[:, :3]
-        bg_z = bias[:, 5]
-        acc_corr = acc_raw - tf.expand_dims(ba, axis=1)
-        gyro_corr_z = gyro_z_raw - tf.expand_dims(bg_z, axis=1)
-
-        B_s = tf.shape(acc_corr)[0]
-        T_s = tf.shape(acc_corr)[1]
-        acc_corr_flat = tf.reshape(acc_corr, (-1, 3))
-        gyro_corr_z_flat = tf.reshape(gyro_corr_z, (-1,))
-        angle_flat = tf.repeat(install_angle, T_s, axis=0)
-        acc_body_flat, gyro_body_z_flat = rotate_imu_to_body(
-            acc_corr_flat, gyro_corr_z_flat, angle_flat)
-        acc_body = tf.reshape(acc_body_flat, (B_s, T_s, 3))
-        gyro_body_z = tf.reshape(gyro_body_z_flat, (B_s, T_s))
-
-        init_e = true_e[:, 0]
-        init_n = true_n[:, 0]
-        init_h = true_h[:, 0]
-
-        pred_e, pred_n, pred_h = integrate_trajectory(
-            init_e, init_n, init_h,
-            acc_body, gyro_body_z, v_ms, TARGET_DT)
-
-        loss, pos_loss, head_loss, install_loss = trajectory_loss(
-            pred_e, pred_n, pred_h,
-            true_e, true_n, true_h, true_v,
-            pred_install_angle=install_angle,
-            true_install_yaw=true_yaw_gt,
-            install_weight=args.install_weight)
-        return loss, pos_loss, head_loss, install_loss, bias, install_angle
-
-    # === 训练循环 ===
-    print('\n[Info] Training...')
-    best_val_loss = float('inf')
-    patience_counter = 0
-    patience = 15
-
+    print("\n[Info] Training...")
+    best_val = float("inf")
+    patience = 0
+    history = []
     for epoch in range(args.epochs):
-        # Train
-        train_loss_sum, train_pos_sum, train_head_sum, train_inst_sum = 0.0, 0.0, 0.0, 0.0
+        sums = np.zeros(4, dtype=np.float64)
         n_train = 0
         for batch in train_ds:
-            if use_install_gt and len(batch) == 8:
-                imu, v, ge, gn, gh, gv, ip, iy = batch
-                loss, pos_l, head_l, inst_l = train_step(imu, v, ge, gn, gh, gv, ip, iy)
-            else:
-                imu, v, ge, gn, gh, gv = batch[:6]
-                loss, pos_l, head_l, inst_l = train_step(imu, v, ge, gn, gh, gv)
-            bs = tf.shape(imu)[0].numpy()
-            train_loss_sum += loss.numpy() * bs
-            train_pos_sum += pos_l.numpy() * bs
-            train_head_sum += head_l.numpy() * bs
-            train_inst_sum += inst_l.numpy() * bs
+            vals = train_step(*batch)
+            bs = int(tf.shape(batch[0])[0].numpy())
+            sums += np.array([v.numpy() for v in vals], dtype=np.float64) * bs
             n_train += bs
+        train_avg = sums / max(n_train, 1)
 
-        # Val
-        val_loss_sum, val_pos_sum, val_head_sum, val_inst_sum = 0.0, 0.0, 0.0, 0.0
+        sums = np.zeros(4, dtype=np.float64)
         n_val = 0
-        last_bias, last_angle = None, None
         for batch in val_ds:
-            if use_install_gt and len(batch) == 8:
-                imu, v, ge, gn, gh, gv, ip, iy = batch
-                loss, pos_l, head_l, inst_l, b, a = val_step(imu, v, ge, gn, gh, gv, ip, iy)
-            else:
-                imu, v, ge, gn, gh, gv = batch[:6]
-                loss, pos_l, head_l, inst_l, b, a = val_step(imu, v, ge, gn, gh, gv)
-            bs = tf.shape(imu)[0].numpy()
-            val_loss_sum += loss.numpy() * bs
-            val_pos_sum += pos_l.numpy() * bs
-            val_head_sum += head_l.numpy() * bs
-            val_inst_sum += inst_l.numpy() * bs
+            vals = val_step(*batch)
+            bs = int(tf.shape(batch[0])[0].numpy())
+            sums += np.array([v.numpy() for v in vals], dtype=np.float64) * bs
             n_val += bs
-            last_bias = b.numpy()
-            last_angle = a.numpy()
+        val_avg = sums / max(n_val, 1)
 
-        tl = train_loss_sum / n_train
-        vl = val_loss_sum / n_val
-        tpl = train_pos_sum / n_train
-        vpl = val_pos_sum / n_val
-        thl = train_head_sum / n_train
-        vhl = val_head_sum / n_val
-        til = train_inst_sum / n_train
-        vil = val_inst_sum / n_val
+        install_deg = model.install_rpy.numpy() * RAD2DEG
+        bias_base = model.bias_base.numpy()
+        row = {
+            "epoch": epoch + 1,
+            "train_loss": float(train_avg[0]),
+            "train_pos_m": float(train_avg[1]),
+            "train_head_rad": float(train_avg[2]),
+            "train_res_l2": float(train_avg[3]),
+            "val_loss": float(val_avg[0]),
+            "val_pos_m": float(val_avg[1]),
+            "val_head_rad": float(val_avg[2]),
+            "val_res_l2": float(val_avg[3]),
+            "install_deg": install_deg.astype(float).tolist(),
+            "bias_base": bias_base.astype(float).tolist(),
+        }
+        history.append(row)
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            angle_deg = np.mean(last_angle) * 180 / np.pi if last_angle is not None else 0
-            print(f'Epoch {epoch+1:3d}/{args.epochs}  '
-                  f'train: loss={tl:.2f} pos={tpl:.2f}m head={thl:.4f}rad inst={til:.2f}°  |  '
-                  f'val: loss={vl:.2f} pos={vpl:.2f}m head={vhl:.4f}rad inst={vil:.2f}°  |  '
-                  f'pred_angle={angle_deg:.2f}°')
+            print(
+                f"Epoch {epoch + 1:3d}/{args.epochs}  "
+                f"train loss={train_avg[0]:.2f} pos={train_avg[1]:.2f}m head={train_avg[2] * RAD2DEG:.2f}°  |  "
+                f"val loss={val_avg[0]:.2f} pos={val_avg[1]:.2f}m head={val_avg[2] * RAD2DEG:.2f}°  |  "
+                f"install rpy=[{install_deg[0]:+.2f},{install_deg[1]:+.2f},{install_deg[2]:+.2f}]°"
+            )
 
-        if vl < best_val_loss:
-            best_val_loss = vl
-            patience_counter = 0
-            weights_path = MODEL_DIR / f'{args.model_name}.weights.h5'
+        if val_avg[0] < best_val:
+            best_val = float(val_avg[0])
+            patience = 0
             model.save_weights(str(weights_path))
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f'[Info] Early stopping at epoch {epoch+1}')
+            patience += 1
+            if patience >= args.patience:
+                print(f"[Info] Early stopping at epoch {epoch + 1}")
                 break
 
-    # === 加载最优权重, 输出结果 ===
-    model.load_weights(str(MODEL_DIR / f'{args.model_name}.weights.h5'))
+    model.load_weights(str(weights_path))
 
-    print('\n[Result] Best model on validation set:')
-    print(f'  Best val loss: {best_val_loss:.2f} m')
+    print("\n[Info] Collecting metrics...")
+    train_metrics_res = collect_metrics(model, train_ds, mu, std, use_residual=True)
+    val_metrics_res = collect_metrics(model, val_ds, mu, std, use_residual=True)
+    train_metrics_fixed = collect_metrics(model, train_ds, mu, std, use_residual=False)
+    val_metrics_fixed = collect_metrics(model, val_ds, mu, std, use_residual=False)
 
-    # 在验证集上取平均零偏和安装角
-    all_bias, all_angle = [], []
-    for batch in val_ds:
-        imu = batch[0]
-        bias, angle = model(imu, training=False)
-        all_bias.append(bias.numpy())
-        all_angle.append(angle.numpy())
+    bias_base = model.bias_base.numpy()
+    install_deg = model.install_rpy.numpy() * RAD2DEG
+    install_eval = install_gt_eval(seqs_val, install_deg)
 
-    bias_mean = np.concatenate(all_bias, axis=0).mean(axis=0)
-    angle_mean = np.concatenate(all_angle, axis=0).mean()
+    print("\n[Result] Best model:")
+    print(f"  Best val loss: {best_val:.2f}")
+    print(f"  Install RPY [deg]: roll={install_deg[0]:.4f} pitch={install_deg[1]:.4f} yaw={install_deg[2]:.4f}")
+    print(f"  Acc bias [g]:      ba_x={bias_base[0]:.6f} ba_y={bias_base[1]:.6f} ba_z={bias_base[2]:.6f}")
+    print(f"  Gyro bias [deg/s]: bg_x={bias_base[3]:.6f} bg_y={bias_base[4]:.6f} bg_z={bias_base[5]:.6f}")
+    print(f"  Val residual RMSE: {val_metrics_res['position_m']['rmse']:.2f} m")
+    print(f"  Val fixed-only RMSE: {val_metrics_fixed['position_m']['rmse']:.2f} m")
+    if install_eval:
+        print(f"  CMCC pitch mean: {install_eval['cmcc_pitch_mean_deg']:.4f}°, error={install_eval['pitch_error_deg']:.4f}°")
+        print(f"  CMCC yaw mean:   {install_eval['cmcc_yaw_mean_deg']:.4f}°, error={install_eval['yaw_error_deg']:.4f}°")
 
-    print(f'\n  安装角 (yaw): {angle_mean * 180 / np.pi:.4f}°')
-    print(f'  加速度零偏 [g]:    ba_x={bias_mean[0]:.6f}  ba_y={bias_mean[1]:.6f}  ba_z={bias_mean[2]:.6f}')
-    print(f'  陀螺仪零偏 [°/s]:  bg_x={bias_mean[3]:.6f}  bg_y={bias_mean[4]:.6f}  bg_z={bias_mean[5]:.6f}')
-
-    if use_install_gt and iy_val is not None:
-        print(f'\n  安装角真值 (yaw): {np.mean(iy_val):.4f}°')
-        print(f'  安装角误差: {abs(angle_mean * 180 / np.pi - np.mean(iy_val)):.4f}°')
-
-    # 保存
     result = {
-        'install_angle_deg': float(angle_mean * 180 / np.pi),
-        'install_angle_rad': float(angle_mean),
-        'acc_bias_g': {'x': float(bias_mean[0]), 'y': float(bias_mean[1]), 'z': float(bias_mean[2])},
-        'gyro_bias_degs': {'x': float(bias_mean[3]), 'y': float(bias_mean[4]), 'z': float(bias_mean[5])},
-        'use_install_gt': use_install_gt,
-        'install_weight': args.install_weight,
+        "model": "bias_angle_v3",
+        "weights": str(weights_path),
+        "best_val_loss": best_val,
+        "acc_bias_g": {"x": float(bias_base[0]), "y": float(bias_base[1]), "z": float(bias_base[2])},
+        "gyro_bias_degs": {"x": float(bias_base[3]), "y": float(bias_base[4]), "z": float(bias_base[5])},
+        "install_angle_deg": {
+            "roll": float(install_deg[0]),
+            "pitch": float(install_deg[1]),
+            "yaw": float(install_deg[2]),
+        },
+        "install_angle_rad": {
+            "roll": float(model.install_rpy.numpy()[0]),
+            "pitch": float(model.install_rpy.numpy()[1]),
+            "yaw": float(model.install_rpy.numpy()[2]),
+        },
+        "train_metrics_with_residual": train_metrics_res,
+        "val_metrics_with_residual": val_metrics_res,
+        "train_metrics_fixed_only": train_metrics_fixed,
+        "val_metrics_fixed_only": val_metrics_fixed,
+        "install_eval_cmcc": install_eval,
+        "config": vars(args),
+        "history": history,
     }
-    if use_install_gt and iy_val is not None:
-        result['install_gt_yaw_deg'] = float(np.mean(iy_val))
-        result['install_error_deg'] = abs(float(angle_mean * 180 / np.pi) - float(np.mean(iy_val)))
-    result_path = MODEL_DIR / f'{args.model_name}_result.json'
-    with open(result_path, 'w') as f:
-        json.dump(result, f, indent=2)
-    print(f'\n  Saved: {result_path}')
+    result_path = MODEL_DIR / f"{args.model_name}_result.json"
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    print(f"  Saved: {result_path}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

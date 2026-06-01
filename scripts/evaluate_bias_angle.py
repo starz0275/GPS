@@ -1,275 +1,373 @@
 #!/usr/bin/env python3
-"""评估 BiasAngleNet 训练效果：零偏 + 安装角 + 轨迹对比。"""
+"""评估 BiasAngleNet v3：全局零偏、全局安装角、fixed-only 与 residual 轨迹对比。"""
 
+from __future__ import annotations
+
+import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import json
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 import tensorflow as tf
 
-from data0109_loader import (
-    DATA0109_ALL_SEGMENTS,
-    DATA0109_VAL_SEGMENT,
-    load_data0109_segments,
+from data0109_loader import DATA0109_ALL_SEGMENTS, load_data0109_segments
+from scripts.train_bias_angle import (
+    DEG2RAD,
+    RAD2DEG,
+    TARGET_DT,
+    BiasAngleNet,
+    predict_trajectory,
+    rotation_imu_to_body,
+    wrap_angle_np,
 )
 from train_ekf import load_or_compute_norm, normalize_imu
-from train_bias_angle import BiasAngleNet, integrate_trajectory, rotate_imu_to_body
 
 MODEL_DIR = ROOT / "trained_models"
 NORM_JSON_0109 = ROOT / "preprocessed_data" / "normalization_stats_data0109.json"
 
-DEG2RAD = np.pi / 180.0
-TARGET_DT = 0.1
 
-
-def predict_bias_and_angle(model, imu_norm, window_size=200):
-    """滑窗推理零偏和安装角。"""
+def build_residual_series(model, imu_norm, window_size):
     T = len(imu_norm)
-    bias = np.zeros((T, 6), dtype=np.float32)
-    angle = np.zeros((T, 1), dtype=np.float32)
-
+    residual = np.zeros((T, 6), dtype=np.float32)
     if T < window_size:
-        return bias, angle
+        return residual
 
-    windows = np.stack([imu_norm[i:i+window_size] for i in range(T - window_size + 1)])
-    raw_bias, raw_angle = model(windows.astype(np.float32), training=False)
-    bias[window_size-1:] = raw_bias.numpy()
-    angle[window_size-1:] = raw_angle.numpy()
-    # 前 window_size-1 帧用第一个有效值填充
-    bias[:window_size-1] = bias[window_size-1]
-    angle[:window_size-1] = angle[window_size-1]
-
-    return bias, angle
+    windows = np.stack(
+        [imu_norm[i:i + window_size] for i in range(T - window_size + 1)]
+    ).astype(np.float32)
+    _, raw_residual, _ = model(windows, training=False)
+    residual[window_size - 1:] = raw_residual.numpy()
+    residual[:window_size - 1] = residual[window_size - 1]
+    return residual
 
 
-def integrate_segment(seq, bias_pred, angle_pred, mu, std):
-    """用预测的零偏和安装角做航位推算。"""
-    imu_norm = normalize_imu(seq['imu'], mu, std)
-    v_ms = seq['v_ms']
+def rotate_np(v, install_rpy):
+    v_tf = tf.constant(v[np.newaxis], dtype=tf.float32)
+    rpy_tf = tf.constant(install_rpy, dtype=tf.float32)
+    return rotation_imu_to_body(v_tf, rpy_tf).numpy()[0]
+
+
+def integrate_np(seq, bias_series, install_rpy, mu, std):
+    imu_norm = normalize_imu(seq["imu"], mu, std)
+    acc_raw = imu_norm[:, :3] * std[:3] + mu[:3]
+    gyro_raw = imu_norm[:, 3:6] * std[3:6] + mu[3:6]
+    acc_corr = acc_raw - bias_series[:, :3]
+    gyro_corr = gyro_raw - bias_series[:, 3:6]
+
+    acc_body = rotate_np(acc_corr, install_rpy)
+    gyro_body = rotate_np(gyro_corr, install_rpy)
+    gyro_z = gyro_body[:, 2]
+
     T = len(imu_norm)
+    pred_e = np.zeros(T, dtype=np.float32)
+    pred_n = np.zeros(T, dtype=np.float32)
+    pred_h = np.zeros(T, dtype=np.float32)
+    pred_e[0] = seq["enu_x"][0]
+    pred_n[0] = seq["enu_y"][0]
+    pred_h[0] = seq["gps_theta"][0]
 
-    # 还原原始 IMU 值
-    acc_raw = imu_norm[:, :3] * std[:3] + mu[:3]  # (T, 3) [g]
-    gyro_z_raw = imu_norm[:, 5] * std[5] + mu[5]  # (T,) [deg/s]
+    for i in range(T - 1):
+        psi = pred_h[i]
+        cp, sp = np.cos(psi), np.sin(psi)
+        ax_ms2 = acc_body[i, 0] * 9.80665
+        ay_ms2 = acc_body[i, 1] * 9.80665
+        acc_e = cp * ax_ms2 - sp * ay_ms2
+        acc_n = sp * ax_ms2 + cp * ay_ms2
+        v_e = seq["v_ms"][i] * cp + acc_e * TARGET_DT
+        v_n = seq["v_ms"][i] * sp + acc_n * TARGET_DT
+        pred_e[i + 1] = pred_e[i] + v_e * TARGET_DT
+        pred_n[i + 1] = pred_n[i] + v_n * TARGET_DT
+        pred_h[i + 1] = wrap_angle_np(psi + gyro_z[i] * DEG2RAD * TARGET_DT)
 
-    # 去零偏
-    ba = bias_pred[:, :3]  # (T, 3)
-    bg_z = bias_pred[:, 5]  # (T,)
-    acc_corr = acc_raw - ba
-    gyro_corr_z = gyro_z_raw - bg_z
-
-    # 旋转到车体系
-    acc_body = np.zeros_like(acc_corr)
-    gyro_body_z = np.zeros_like(gyro_corr_z)
-    for t in range(T):
-        psi = angle_pred[t, 0]  # [rad]
-        ca, sa = np.cos(psi), np.sin(psi)
-        acc_body[t, 0] = ca * acc_corr[t, 0] + sa * acc_corr[t, 1]
-        acc_body[t, 1] = -sa * acc_corr[t, 0] + ca * acc_corr[t, 1]
-        acc_body[t, 2] = acc_corr[t, 2]
-        gyro_body_z[t] = gyro_corr_z[t]
-
-    # 航位推算
-    enu_e = seq['enu_x']
-    enu_n = seq['enu_y']
-    gps_theta = seq['gps_theta']
-
-    # 用 tf 函数做积分
-    init_e = tf.constant([enu_e[0]], dtype=tf.float32)
-    init_n = tf.constant([enu_n[0]], dtype=tf.float32)
-    init_h = tf.constant([gps_theta[0]], dtype=tf.float32)
-
-    acc_tf = tf.constant(acc_body[np.newaxis], dtype=tf.float32)  # (1, T, 3)
-    gyro_tf = tf.constant(gyro_body_z[np.newaxis], dtype=tf.float32)  # (1, T)
-    v_tf = tf.constant(v_ms[np.newaxis], dtype=tf.float32)  # (1, T)
-
-    pred_e, pred_n, pred_h = integrate_trajectory(
-        init_e, init_n, init_h, acc_tf, gyro_tf, v_tf, TARGET_DT)
-
-    # 返回 T+1 个点，去掉最后一个点以匹配 T
-    return pred_e.numpy()[0][:T], pred_n.numpy()[0][:T], pred_h.numpy()[0][:T]
+    return pred_e, pred_n, pred_h
 
 
-def evaluate_segment(model, seq, mu, std, window_size=200):
-    """评估单段数据。"""
-    imu_norm = normalize_imu(seq['imu'], mu, std)
+def metric_stats(values):
+    values = np.asarray(values)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return {"mean": None, "rmse": None, "p95": None, "max": None}
+    return {
+        "mean": float(np.mean(values)),
+        "rmse": float(np.sqrt(np.mean(values ** 2))),
+        "p95": float(np.percentile(values, 95)),
+        "max": float(np.max(values)),
+    }
 
-    # 预测零偏和安装角
-    bias_pred, angle_pred = predict_bias_and_angle(model, imu_norm, window_size)
 
-    # 航位推算
-    pred_e, pred_n, pred_h = integrate_segment(seq, bias_pred, angle_pred, mu, std)
+def build_eval_windows(seq, mu, std, window_size):
+    imu_norm = normalize_imu(seq["imu"], mu, std)
+    pos_valid = seq.get("gps_pos_valid", seq["gps_valid"]).astype(bool)
+    head_valid = seq["gps_valid"].astype(bool)
+    starts, X, V, GE, GN, GH, PV, HV = [], [], [], [], [], [], [], []
 
-    # GPS 真值
-    true_e = seq['enu_x']
-    true_n = seq['enu_y']
-    true_h = seq['gps_theta']
-    cmcc_ok = seq['cmcc_ok']
-    cmcc_stable = seq['cmcc_stable']
+    T = len(imu_norm)
+    for i in range(0, T - window_size):
+        end = i + window_size
+        if not head_valid[i]:
+            continue
+        if pos_valid[i:end + 1].sum() < (window_size + 1) * 0.5:
+            continue
+        starts.append(i)
+        X.append(imu_norm[i:end])
+        V.append(seq["v_ms"][i:end])
+        GE.append(seq["enu_x"][i:end + 1])
+        GN.append(seq["enu_y"][i:end + 1])
+        GH.append(seq["gps_theta"][i:end + 1])
+        PV.append(pos_valid[i:end + 1])
+        HV.append(head_valid[i:end + 1])
 
-    # 安装角真值
-    install_gt = seq.get('cmcc_install_deg', None)
+    if not starts:
+        raise RuntimeError(f"{seq['segment']} 没有可评估窗口")
+
+    return (
+        np.array(starts, dtype=np.int32),
+        np.stack(X).astype(np.float32),
+        np.stack(V).astype(np.float32),
+        np.stack(GE).astype(np.float32),
+        np.stack(GN).astype(np.float32),
+        np.stack(GH).astype(np.float32),
+        np.stack(PV).astype(bool),
+        np.stack(HV).astype(bool),
+    )
+
+
+def evaluate_segment(model, seq, mu, std, window_size, batch_size=64):
+    starts, X, V, GE, GN, GH, PV, HV = build_eval_windows(seq, mu, std, window_size)
+    T = len(seq["imu"])
+    bias_base = model.bias_base.numpy().astype(np.float32)
+    install_rpy = model.install_rpy.numpy().astype(np.float32)
+
+    fixed_e_sum = np.zeros(T, dtype=np.float64)
+    fixed_n_sum = np.zeros(T, dtype=np.float64)
+    fixed_h_sum = np.zeros(T, dtype=np.complex128)
+    res_e_sum = np.zeros(T, dtype=np.float64)
+    res_n_sum = np.zeros(T, dtype=np.float64)
+    res_h_sum = np.zeros(T, dtype=np.complex128)
+    count = np.zeros(T, dtype=np.float64)
+    residual_sum = np.zeros((T, 6), dtype=np.float64)
+    residual_count = np.zeros(T, dtype=np.float64)
+
+    for b0 in range(0, len(starts), batch_size):
+        b1 = min(b0 + batch_size, len(starts))
+        imu = tf.constant(X[b0:b1], dtype=tf.float32)
+        v = tf.constant(V[b0:b1], dtype=tf.float32)
+        ge = tf.constant(GE[b0:b1], dtype=tf.float32)
+        gn = tf.constant(GN[b0:b1], dtype=tf.float32)
+        gh = tf.constant(GH[b0:b1], dtype=tf.float32)
+
+        fixed = predict_trajectory(model, imu, v, ge, gn, gh, mu, std, use_residual=False, training=False)
+        residual_pred = predict_trajectory(model, imu, v, ge, gn, gh, mu, std, use_residual=True, training=False)
+        fixed_e, fixed_n, fixed_h = [x.numpy() for x in fixed[:3]]
+        res_e, res_n, res_h, _, residual, _ = residual_pred
+        res_e, res_n, res_h, residual = res_e.numpy(), res_n.numpy(), res_h.numpy(), residual.numpy()
+
+        for j, start in enumerate(starts[b0:b1]):
+            sl = slice(start, start + window_size + 1)
+            fixed_e_sum[sl] += fixed_e[j]
+            fixed_n_sum[sl] += fixed_n[j]
+            fixed_h_sum[sl] += np.exp(1j * fixed_h[j])
+            res_e_sum[sl] += res_e[j]
+            res_n_sum[sl] += res_n[j]
+            res_h_sum[sl] += np.exp(1j * res_h[j])
+            count[sl] += 1.0
+            end_idx = start + window_size - 1
+            residual_sum[end_idx] += residual[j]
+            residual_count[end_idx] += 1.0
+
+    valid_count = count > 0
+    fixed_e = np.full(T, np.nan, dtype=np.float32)
+    fixed_n = np.full(T, np.nan, dtype=np.float32)
+    fixed_h = np.full(T, np.nan, dtype=np.float32)
+    res_e = np.full(T, np.nan, dtype=np.float32)
+    res_n = np.full(T, np.nan, dtype=np.float32)
+    res_h = np.full(T, np.nan, dtype=np.float32)
+    fixed_e[valid_count] = (fixed_e_sum[valid_count] / count[valid_count]).astype(np.float32)
+    fixed_n[valid_count] = (fixed_n_sum[valid_count] / count[valid_count]).astype(np.float32)
+    fixed_h[valid_count] = np.angle(fixed_h_sum[valid_count]).astype(np.float32)
+    res_e[valid_count] = (res_e_sum[valid_count] / count[valid_count]).astype(np.float32)
+    res_n[valid_count] = (res_n_sum[valid_count] / count[valid_count]).astype(np.float32)
+    res_h[valid_count] = np.angle(res_h_sum[valid_count]).astype(np.float32)
+
+    residual_series = np.zeros((T, 6), dtype=np.float32)
+    has_residual = residual_count > 0
+    residual_series[has_residual] = (residual_sum[has_residual] / residual_count[has_residual, None]).astype(np.float32)
+    if has_residual.any():
+        idx = np.where(has_residual)[0]
+        for k in range(6):
+            residual_series[:, k] = np.interp(np.arange(T), idx, residual_series[idx, k])
+
+    bias_fixed = np.tile(bias_base.reshape(1, 6), (T, 1))
+    bias_res = bias_fixed + residual_series
+
+    pos_valid = seq.get("gps_pos_valid", seq["gps_valid"]).astype(bool) & valid_count
+    head_valid = seq["gps_valid"].astype(bool) & valid_count
+
+    fixed_pos_err = np.sqrt((fixed_e - seq["enu_x"]) ** 2 + (fixed_n - seq["enu_y"]) ** 2)
+    res_pos_err = np.sqrt((res_e - seq["enu_x"]) ** 2 + (res_n - seq["enu_y"]) ** 2)
+    fixed_head_err = np.abs(wrap_angle_np(fixed_h - seq["gps_theta"])) * RAD2DEG
+    res_head_err = np.abs(wrap_angle_np(res_h - seq["gps_theta"])) * RAD2DEG
 
     return {
-        'pred_e': pred_e, 'pred_n': pred_n, 'pred_h': pred_h,
-        'true_e': true_e, 'true_n': true_n, 'true_h': true_h,
-        'bias_pred': bias_pred, 'angle_pred': angle_pred,
-        'install_gt': install_gt,
-        'cmcc_ok': cmcc_ok, 'cmcc_stable': cmcc_stable,
-        'cmcc_bias_6d': seq.get('cmcc_bias_6d', None),
+        "true_e": seq["enu_x"],
+        "true_n": seq["enu_y"],
+        "true_h": seq["gps_theta"],
+        "fixed_e": fixed_e,
+        "fixed_n": fixed_n,
+        "fixed_h": fixed_h,
+        "res_e": res_e,
+        "res_n": res_n,
+        "res_h": res_h,
+        "pos_valid": pos_valid,
+        "head_valid": head_valid,
+        "bias_fixed": bias_fixed,
+        "bias_residual": residual,
+        "bias_used": bias_res,
+        "install_rpy": install_rpy,
+        "cmcc_bias_6d": seq.get("cmcc_bias_6d"),
+        "cmcc_install_deg": seq.get("cmcc_install_deg"),
+        "cmcc_stable": seq.get("cmcc_stable", np.zeros(T, dtype=bool)),
+        "fixed_position_m": metric_stats(fixed_pos_err[pos_valid]),
+        "residual_position_m": metric_stats(res_pos_err[pos_valid]),
+        "fixed_heading_deg": metric_stats(fixed_head_err[head_valid]),
+        "residual_heading_deg": metric_stats(res_head_err[head_valid]),
+        "fixed_pos_err": fixed_pos_err,
+        "res_pos_err": res_pos_err,
     }
 
 
 def plot_results(results, segment_name, save_dir):
-    """绘制评估结果。"""
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    t = np.arange(len(results["true_e"])) * TARGET_DT
+    valid = results["pos_valid"]
+    install_deg = results["install_rpy"] * RAD2DEG
 
-    # 1. 轨迹对比
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
     ax = axes[0, 0]
-    ax.plot(results['true_e'], results['true_n'], 'b-', label='GPS True', linewidth=1.5)
-    ax.plot(results['pred_e'], results['pred_n'], 'r--', label='Predicted', linewidth=1.5)
-    ax.set_xlabel('East [m]')
-    ax.set_ylabel('North [m]')
-    ax.set_title('Trajectory Comparison')
+    ax.plot(results["true_e"][valid], results["true_n"][valid], "k-", lw=1.2, label="GNSS True")
+    ax.plot(results["fixed_e"], results["fixed_n"], color="#1f77b4", lw=1.1, label="Fixed-only")
+    ax.plot(results["res_e"], results["res_n"], "r--", lw=1.1, label="Fixed + residual")
+    ax.set_title("Trajectory")
+    ax.set_xlabel("East [m]")
+    ax.set_ylabel("North [m]")
+    ax.axis("equal")
+    ax.grid(True, alpha=0.35)
     ax.legend()
-    ax.grid(True)
-    ax.axis('equal')
 
-    # 2. 安装角对比
     ax = axes[0, 1]
-    T = len(results['angle_pred'])
-    t = np.arange(T) * TARGET_DT
-    pred_angle_deg = results['angle_pred'][:, 0] * 180 / np.pi
-    ax.plot(t, pred_angle_deg, 'r-', label='Predicted', linewidth=1)
-    if results['install_gt'] is not None:
-        ax.plot(t, results['install_gt'][:, 1], 'b-', label='GT (rbv_yaw)', linewidth=1)
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Install Angle [deg]')
-    ax.set_title('Install Angle (yaw)')
-    ax.legend()
-    ax.grid(True)
+    ax.axhline(install_deg[0], color="#9467bd", lw=1.4, label=f"pred roll {install_deg[0]:.2f}°")
+    ax.axhline(install_deg[1], color="#2ca02c", lw=1.4, label=f"pred pitch {install_deg[1]:.2f}°")
+    ax.axhline(install_deg[2], color="#d62728", lw=1.4, label=f"pred yaw {install_deg[2]:.2f}°")
+    if results["cmcc_install_deg"] is not None:
+        stable = results["cmcc_stable"]
+        ax.plot(t[stable], results["cmcc_install_deg"][stable, 0], color="#2ca02c", alpha=0.45, lw=0.8, label="CMCC rbv_pitch")
+        ax.plot(t[stable], results["cmcc_install_deg"][stable, 1], color="#d62728", alpha=0.45, lw=0.8, label="CMCC rbv_yaw")
+    ax.set_title("Global Install Angles")
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Angle [deg]")
+    ax.grid(True, alpha=0.35)
+    ax.legend(fontsize=8)
 
-    # 3. 零偏对比 (陀螺 Z)
     ax = axes[1, 0]
-    if results['cmcc_bias_6d'] is not None:
-        ax.plot(t, results['cmcc_bias_6d'][:, 5], 'b-', label='CMCC GT', linewidth=1)
-    ax.plot(t, results['bias_pred'][:, 5], 'r-', label='Predicted', linewidth=1)
-    stable_mask = results['cmcc_stable']
-    if stable_mask.any():
-        ax.fill_between(t, 0, 1, where=stable_mask, alpha=0.2, color='green', label='Stable')
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Gyro Z Bias [deg/s]')
-    ax.set_title('Gyroscope Z Bias')
+    ax.plot(t, results["fixed_pos_err"], color="#1f77b4", lw=0.9, label="Fixed-only")
+    ax.plot(t, results["res_pos_err"], "r--", lw=0.9, label="Fixed + residual")
+    ax.fill_between(t, 0, np.nanmax(results["res_pos_err"]) if np.isfinite(results["res_pos_err"]).any() else 1,
+                    where=valid, alpha=0.08, color="green", label="GNSS valid")
+    ax.set_title("Position Error")
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Error [m]")
+    ax.grid(True, alpha=0.35)
     ax.legend()
-    ax.grid(True)
 
-    # 4. 零偏对比 (加速度 X)
     ax = axes[1, 1]
-    if results['cmcc_bias_6d'] is not None:
-        ax.plot(t, results['cmcc_bias_6d'][:, 0], 'b-', label='CMCC GT', linewidth=1)
-    ax.plot(t, results['bias_pred'][:, 0], 'r-', label='Predicted', linewidth=1)
-    if stable_mask.any():
-        ax.fill_between(t, 0, 1, where=stable_mask, alpha=0.2, color='green', label='Stable')
-    ax.set_xlabel('Time [s]')
-    ax.set_ylabel('Acc X Bias [g]')
-    ax.set_title('Accelerometer X Bias')
+    ax.plot(t, results["bias_used"][:, 5], "r-", lw=0.9, label="bg_z used")
+    ax.axhline(results["bias_fixed"][0, 5], color="#1f77b4", lw=1.1, label="bg_z base")
+    if results["cmcc_bias_6d"] is not None:
+        stable = results["cmcc_stable"]
+        ax.plot(t[stable], results["cmcc_bias_6d"][stable, 5], "k-", alpha=0.5, lw=0.8, label="CMCC bg_z")
+    ax.set_title("Gyro Z Bias")
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Bias [deg/s]")
+    ax.grid(True, alpha=0.35)
     ax.legend()
-    ax.grid(True)
 
-    plt.suptitle(f'BiasAngleNet Evaluation: {segment_name}', fontsize=14)
-    plt.tight_layout()
-
-    save_path = save_dir / f'bias_angle_eval_{segment_name}.png'
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f'  图已保存: {save_path}')
-    plt.close()
+    fig.suptitle(
+        f"BiasAngleNet v3 Evaluation: {segment_name} | "
+        f"res RMSE={results['residual_position_m']['rmse']:.2f}m, "
+        f"fixed RMSE={results['fixed_position_m']['rmse']:.2f}m",
+        fontsize=13,
+    )
+    fig.tight_layout()
+    out_path = save_dir / f"bias_angle_v3_eval_{segment_name}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  图已保存: {out_path}")
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Evaluate BiasAngleNet')
-    parser.add_argument('--weights', type=str, default=str(MODEL_DIR / 'bias_angle_v2.weights.h5'))
-    parser.add_argument('--window-size', type=int, default=200)
-    parser.add_argument('--segments', nargs='+', default=None)
+
+    parser = argparse.ArgumentParser(description="Evaluate BiasAngleNet v3")
+    parser.add_argument("--weights", type=str, default=str(MODEL_DIR / "bias_angle_v3.weights.h5"))
+    parser.add_argument("--window-size", type=int, default=200)
+    parser.add_argument("--segments", nargs="+", default=None)
+    parser.add_argument("--output-json", type=str, default=str(MODEL_DIR / "bias_angle_v3_eval_summary.json"))
     args = parser.parse_args()
 
     weights_path = Path(args.weights)
     if not weights_path.exists():
-        print(f'权重文件不存在: {weights_path}')
-        return
+        raise FileNotFoundError(f"权重文件不存在: {weights_path}")
 
-    print(f'[Info] 加载权重: {weights_path}')
     model = BiasAngleNet(window_size=args.window_size)
     model(tf.zeros((1, args.window_size, 7), dtype=tf.float32))
     model.load_weights(str(weights_path))
 
-    print('[Info] 加载数据...')
     segments = args.segments if args.segments else DATA0109_ALL_SEGMENTS
-    seqs = load_data0109_segments(segments)
-    seqs = [s for s in seqs if s is not None]
-
+    seqs = [s for s in load_data0109_segments(segments) if s is not None]
     mu, std, _ = load_or_compute_norm(seqs, NORM_JSON_0109)
 
-    save_dir = MODEL_DIR
-    save_dir.mkdir(exist_ok=True)
+    summary = {
+        "weights": str(weights_path),
+        "install_angle_deg": {
+            "roll": float(model.install_rpy.numpy()[0] * RAD2DEG),
+            "pitch": float(model.install_rpy.numpy()[1] * RAD2DEG),
+            "yaw": float(model.install_rpy.numpy()[2] * RAD2DEG),
+        },
+        "bias_base": model.bias_base.numpy().astype(float).tolist(),
+        "segments": {},
+    }
 
-    all_results = []
     for seq in seqs:
-        seg_name = seq['segment']
-        print(f'\n[评估] {seg_name}')
-
+        print(f"\n[评估] {seq['segment']}")
         results = evaluate_segment(model, seq, mu, std, args.window_size)
+        print(
+            f"  fixed-only: mean={results['fixed_position_m']['mean']:.2f}m "
+            f"rmse={results['fixed_position_m']['rmse']:.2f}m "
+            f"p95={results['fixed_position_m']['p95']:.2f}m"
+        )
+        print(
+            f"  residual:   mean={results['residual_position_m']['mean']:.2f}m "
+            f"rmse={results['residual_position_m']['rmse']:.2f}m "
+            f"p95={results['residual_position_m']['p95']:.2f}m"
+        )
+        plot_results(results, seq["id"], MODEL_DIR)
+        summary["segments"][seq["id"]] = {
+            "name": seq["segment"],
+            "fixed_position_m": results["fixed_position_m"],
+            "residual_position_m": results["residual_position_m"],
+            "fixed_heading_deg": results["fixed_heading_deg"],
+            "residual_heading_deg": results["residual_heading_deg"],
+        }
 
-        # 计算误差
-        T = len(results['pred_e'])
-        pos_err = np.sqrt((results['pred_e'] - results['true_e'])**2 +
-                         (results['pred_n'] - results['true_n'])**2)
-
-        # 安装角误差
-        pred_angle_deg = results['angle_pred'][:, 0] * 180 / np.pi
-        if results['install_gt'] is not None:
-            angle_err = np.abs(pred_angle_deg - results['install_gt'][:, 1])
-            stable = results['cmcc_stable']
-            if stable.any():
-                print(f'  安装角误差 (stable): mean={angle_err[stable].mean():.3f}° std={angle_err[stable].std():.3f}°')
-                print(f'  安装角预测 (stable): mean={pred_angle_deg[stable].mean():.3f}°')
-                print(f'  安装角真值 (stable): mean={results["install_gt"][stable, 1].mean():.3f}°')
-
-        # 轨迹误差
-        gps_valid = results['true_e'] != 0
-        if gps_valid.any():
-            print(f'  轨迹位置误差: mean={pos_err[gps_valid].mean():.2f}m max={pos_err[gps_valid].max():.2f}m')
-
-        plot_results(results, seq['id'], save_dir)
-        all_results.append((seg_name, results))
-
-    # 打印总结
-    print('\n' + '='*60)
-    print('评估总结')
-    print('='*60)
-
-    # 加载训练结果
-    result_json = weights_path.parent / (weights_path.stem.replace('.weights', '') + '_result.json')
-    if result_json.exists():
-        with open(result_json, 'r') as f:
-            train_result = json.load(f)
-        print(f'\n训练结果 ({result_json.name}):')
-        print(f'  安装角 (yaw): {train_result.get("install_angle_deg", "N/A"):.4f}°')
-        if 'install_gt_yaw_deg' in train_result:
-            print(f'  安装角真值: {train_result["install_gt_yaw_deg"]:.4f}°')
-            print(f'  安装角误差: {train_result["install_error_deg"]:.4f}°')
-        if 'acc_bias_g' in train_result:
-            ab = train_result['acc_bias_g']
-            print(f'  加速度零偏 [g]: ba_x={ab["x"]:.6f} ba_y={ab["y"]:.6f} ba_z={ab["z"]:.6f}')
-        if 'gyro_bias_degs' in train_result:
-            gb = train_result['gyro_bias_degs']
-            print(f'  陀螺仪零偏 [°/s]: bg_x={gb["x"]:.6f} bg_y={gb["y"]:.6f} bg_z={gb["z"]:.6f}')
+    output_json = Path(args.output_json)
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"\n[Info] Summary saved: {output_json}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

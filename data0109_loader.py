@@ -69,24 +69,82 @@ def resolve_data0109_paths(segment_name: str) -> Tuple[Path, Path, Path, Path]:
     return imu_f, spd_f, gps_f, cmcc_f
 
 
-def clean_gps_outliers(t, lat, lon, max_kmh=GPS_MAX_KMH):
+def clean_gps_outliers(t, lat, lon, base_valid=None, max_kmh=GPS_MAX_KMH):
     lat = lat.copy()
     lon = lon.copy()
-    valid = np.ones(len(t), dtype=bool)
-    for i in range(1, len(t)):
-        dt = t[i] - t[i - 1]
+    if base_valid is None:
+        valid = np.isfinite(lat) & np.isfinite(lon) & (lat > VALID_LAT_DEG) & (lon > VALID_LAT_DEG)
+    else:
+        valid = (
+            base_valid.copy()
+            & np.isfinite(lat)
+            & np.isfinite(lon)
+            & (lat > VALID_LAT_DEG)
+            & (lon > VALID_LAT_DEG)
+        )
+
+    valid_idx = np.where(valid)[0]
+    if len(valid_idx) < 2:
+        return lat, lon, valid
+
+    prev = valid_idx[0]
+    for i in valid_idx[1:]:
+        dt = t[i] - t[prev]
         if dt <= 0:
             valid[i] = False
             continue
-        dlat = (lat[i] - lat[i - 1]) * DEG2RAD * EARTH_A
-        dlon = (lon[i] - lon[i - 1]) * DEG2RAD * EARTH_A * np.cos(lat[i - 1] * DEG2RAD)
+        dlat = (lat[i] - lat[prev]) * DEG2RAD * EARTH_A
+        dlon = (lon[i] - lon[prev]) * DEG2RAD * EARTH_A * np.cos(lat[prev] * DEG2RAD)
         spd = np.sqrt(dlat ** 2 + dlon ** 2) / dt * 3.6
         if spd > max_kmh:
             valid[i] = False
-    if valid.sum() >= 2:
-        lat[~valid] = np.interp(t[~valid], t[valid], lat[valid])
-        lon[~valid] = np.interp(t[~valid], t[valid], lon[valid])
+            continue
+        prev = i
+
+    valid_idx = np.where(valid)[0]
+    if len(valid_idx) >= 2:
+        lat = np.interp(t, t[valid_idx], lat[valid_idx])
+        lon = np.interp(t, t[valid_idx], lon[valid_idx])
+
     return lat, lon, valid
+
+
+def interpolate_clean_gps(tg, gps):
+    """插值 GNSS，剔除起始 0/无效定位，返回连续经纬度和位置有效掩码。"""
+    gps_t = gps["Time_s"].values
+    lat_src = gps["Latitude_deg"].values
+    lon_src = gps["Longitude_deg"].values
+    if "GpsFlag" in gps:
+        flag_src = gps["GpsFlag"].values
+    else:
+        flag_src = np.ones_like(lat_src)
+
+    src_valid = (
+        np.isfinite(gps_t)
+        & np.isfinite(lat_src)
+        & np.isfinite(lon_src)
+        & (lat_src > VALID_LAT_DEG)
+        & (lon_src > VALID_LAT_DEG)
+        & (flag_src > 0)
+    )
+    if src_valid.sum() < 2:
+        raise RuntimeError("GNSS 有效点不足，无法构造 ENU 真值")
+
+    lat_i = interp1d(
+        gps_t[src_valid], lat_src[src_valid],
+        bounds_error=False, fill_value=np.nan,
+    )(tg)
+    lon_i = interp1d(
+        gps_t[src_valid], lon_src[src_valid],
+        bounds_error=False, fill_value=np.nan,
+    )(tg)
+    flag_i = interp1d(
+        gps_t, (flag_src > 0).astype(np.float32),
+        kind="nearest", bounds_error=False, fill_value=0.0,
+    )(tg) > 0.5
+
+    base_valid = flag_i & np.isfinite(lat_i) & np.isfinite(lon_i)
+    return clean_gps_outliers(tg, lat_i, lon_i, base_valid=base_valid)
 
 
 def wgs84_to_enu_simple(lat_arr, lon_arr, ref_lat, ref_lon):
@@ -206,17 +264,15 @@ def load_data0109_seq(
         v_ms = (v_kmh / 3.6).astype(np.float32)
         imu_mat = np.concatenate([imu_mat, v_ms.reshape(-1, 1)], axis=1)
 
-        lat_raw = interp1(gps["Time_s"].values, gps["Latitude_deg"].values)
-        lon_raw = interp1(gps["Time_s"].values, gps["Longitude_deg"].values)
-        lat_c, lon_c, gps_ok = clean_gps_outliers(tg, lat_raw, lon_raw)
+        lat_c, lon_c, gps_pos_valid = interpolate_clean_gps(tg, gps)
 
-        ref_lat, ref_lon = lat_c[gps_ok][0], lon_c[gps_ok][0]
+        ref_lat, ref_lon = lat_c[gps_pos_valid][0], lon_c[gps_pos_valid][0]
         enu_x, enu_y = wgs84_to_enu_simple(lat_c, lon_c, ref_lat, ref_lon)
 
         dx = np.gradient(enu_x, tg)
         dy = np.gradient(enu_y, tg)
         speed_gps = np.sqrt(dx ** 2 + dy ** 2)
-        gps_head_valid = gps_ok & (v_ms > MIN_SPEED_MS) & (speed_gps > 0.1)
+        gps_head_valid = gps_pos_valid & (v_ms > MIN_SPEED_MS) & (speed_gps > 0.1)
         gps_theta = np.arctan2(dy, dx)
         gps_theta_smooth = median_filter(gps_theta, size=11)
 
@@ -250,6 +306,7 @@ def load_data0109_seq(
             "v_ms": v_ms,
             "gps_theta": gps_theta_smooth.astype(np.float32),
             "gps_valid": gps_head_valid,
+            "gps_pos_valid": gps_pos_valid,
             "enu_x": enu_x.astype(np.float32),
             "enu_y": enu_y.astype(np.float32),
             "cmcc_bias_6d": cmcc_bias,
@@ -262,7 +319,8 @@ def load_data0109_seq(
         print(
             f"  [{segment_name}] {len(tg)} 帧  "
             f"cmcc_ok={ok.mean():.1%}  cmcc_stable(settle={CMCC_SETTLE_S:.0f}s)={stable.mean():.1%}  "
-            f"GPS航向有效={gps_head_valid.mean():.1%}"
+            f"GPS位置有效={gps_pos_valid.mean():.1%}  GPS航向有效={gps_head_valid.mean():.1%}  "
+            f"ENU跨度=({np.ptp(enu_x):.1f}m,{np.ptp(enu_y):.1f}m)"
         )
         return seq
     except Exception as e:
